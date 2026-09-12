@@ -43,12 +43,12 @@ R Markdown notebooks containing the full modeling pipeline:
 
 - `Model_summary.Rmd` — main model summary and comparison
 - `Model_summary_random_effect_ver2.Rmd` — extended version with random effects
-- `model 1 with(out) fatigue limit.Rmd` — Basquin models with and without a fatigue limit
-- `each stress modeling.Rmd` — per-stress-level modeling
+- `basquin_model_with_without_fatigue_limit.Rmd` — Basquin models with and without a fatigue limit
+- `each_stress_modeling.Rmd` — per-stress-level modeling
 
 ## Report
 
-- `摘要.pdf` / `摘要.docx` — project abstract and full write-up (Traditional Chinese)
+- `abstract.pdf` / `abstract.docx` — project abstract and full write-up (Traditional Chinese)
 
 ## Tech Stack
 
