@@ -61,3 +61,7 @@ R Markdown notebooks containing the full modeling pipeline:
 ---
 
 *大專生研究計畫 (Undergraduate Research Project) · Department of Statistics & Institute of Data Science.*
+
+## How to Reproduce
+
+Open any `.Rmd` file in RStudio and knit it, or run the chunks interactively. All datasets are in the repository root.
