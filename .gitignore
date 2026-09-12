@@ -1,0 +1,17 @@
+# R session / history files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Knitted / cache output
+*_cache/
+*_files/
+.Rmd.html
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/

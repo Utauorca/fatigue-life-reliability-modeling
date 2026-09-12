@@ -1,0 +1,882 @@
+---
+title: "fatigue life analysis"
+author: "謝柏陞"
+date: "2025-01-23"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+documentclass: ctexart
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  dev = "png",         
+  dpi = 300,           
+  fig.retina = 2,      
+  
+  # --- 新增/修改圖片大小控制 ---
+  fig.width = 8,         # 增加畫布寬度，適合並排圖表
+  fig.height = 5,        # 設定畫布高度
+  # fig.asp = 0.618,     # 或者使用長寬比，兩者擇一即可
+  
+  out.width = "90%",     # 稍微縮小顯示比例，留點邊界美感
+  fig.align = "center"   # 讓圖片置中
+)
+```
+
+## 
+```{r}
+library(tidyverse)
+
+# 將資料轉換為數據框
+data <- read.table(text = "
+4.8, 8.8, 15.0, 18.0, 31, 45, 72, 104, 172, 423
+6.0, 9.8, 16.6, 21.2, 38, 45, 83, 110, 226, 439
+7.6, 11.6, 16.6, 24.0, 43, 46, 93, 137, 229, 441
+8.7, 12.0, 16.7, 25.2, 44, 57, 95, 149, 253, 509
+9.0, 12.2, 18.5, 26.0, 45, 62, 102, 151, 286, 571
+9.0, 13.2, 18.6, 26.2, 45, 63, 103, 163, 290, 616
+9.8, 14.4, 19.0, 28.1, 46, 64, 105, 164, 303, 648
+10.3, 15.0, 19.9, 29.7, 47, 68, 108, 166, 312, 664
+10.5, 15.1, 20.3, 32.4, 48, 68, 112, 171, 318, 685
+10.8, 16.9, 20.5, 32.8, 49, 70, 113, 174, 325, 689
+12.2, 17.4, 21.3, 34.0, 54, 72, 115, 179, 328, 767
+12.4, 17.8, 21.8, 34.1, 54, 73, 117, 184, 332, 842
+12.4, 18.0, 22.0, 34.3, 56, 75, 121, 189, 340, 886
+13.6, 18.0, 24.3, 35.1, 58, 75, 126, 190, 342, 910
+13.9, 18.7, 24.5, 38.8, 60, 81, 127, 208, 343, 978
+14.0, 21.7, 25.5, 39.0, 60, 82, 128, 208, 347, 1117
+14.4,21.9,25.9,43,61,82,130,214,358,1135
+15.3, 22.4, 26.3, 46.0, 64, 85, 131, 216, 373, 1137
+16.1, 22.7, 30.2, 46.1, 68, 88, 137, 224, 400, 1192
+18.8, 24.0, 30.6, 46.4, 81, 97, 151, 238, 431, 1311
+", sep = ",", header = FALSE)
+# 設置列名為數字值
+colnames(data) <- c(27, 22.5, 19, 16, 13.5, 11.7, 10, 9.25, 8.25, 7.25)
+
+# 添加行索引作為 censoring
+data <- data %>%
+  mutate(censoring = row_number())
+
+# 將數據框轉換為長格式
+long_data <- data %>%
+  pivot_longer(
+    cols = -censoring,   # 除了 censoring 列，其他列都轉換
+    names_to = "sigma",  # 新的列名
+    values_to = "cycle"  # 對應的值
+  )
+
+# 轉換 sigma 為數字，並將 censoring 全部改為 1
+copper_data <- long_data %>%
+  mutate(sigma = as.numeric(sigma), censoring = 1)
+
+# 查看結果
+copper_data
+```
+```{r}
+library(tidyverse)
+
+# 讀取 CSV 檔案
+data <- read_csv("248_adjusted.csv")
+
+# 如果 CSV 已經是長格式（有 sigma, cycle, censoring 欄位）
+# 修改後的資料處理部分
+
+# 2. 修改後的資料處理部分：只要 sigma 存在，則 censoring = 1
+copper_data <- data %>%
+  mutate(
+    sigma = as.numeric(stress),
+    # 使用 !is.na() 檢查 sigma 是否有值，若有值則為 1，否則為 0
+    # 這會將所有具有應力紀錄的觀測點標記為「已失效」
+    censoring = if_else(!is.na(sigma), 1, 0)
+  )
+copper_data <- data %>%
+  mutate(
+    sigma = as.numeric(stress),
+    # 偵測 "Censoring Indicator" 欄位，若是 "Failed" 則為 1，否則為 0
+    censoring = ifelse(`censoring` == 1, 1, 0)
+  )
+
+# 查看結果
+copper_data
+stress.list <- unique(copper_data$sigma)
+```
+
+
+
+## 數據處理
+此處模型是用$$\mu=\beta_0+\beta_1*x_i+ \sigma_N\quad x_i=log(S_e) \ ,\quad \sigma_N$$
+
+```{r}
+life <- copper_data$cycles
+life.log<-log(life)
+cen<-copper_data$censoring
+wts<-copper_data$censoring
+
+Stress.Amplitude <- copper_data$sigma
+x <- log(Stress.Amplitude)  #log 化
+
+```
+
+
+
+```{r}
+neg.log.likelihood.AR.lnor.twoparam <- function(par, data.t, data.censored, wts, x){
+mu <-  par[1] # µ
+sigma <- par[2]   # lognormal 的 σ
+### likelihood function ###
+lj <- wts*data.censored*dlnorm(data.t, mu, sigma, log = TRUE)+ 
+wts*(1-data.censored)*log(1-plnorm(data.t, mu, sigma))  
+return(-sum(lj))
+}
+```
+
+```{r}
+neg.log.likelihood.AR.weibull.twoparam <- function(par, data.t, data.censored, wts, x){
+  mu <- par[1]    # sev 的 µ
+  sigma <- par[2]             # sev 的 σ
+  z <- (log(data.t) - mu) / sigma
+  # exact failure (indicator = 1)
+  log_density <- -log(sigma) - log(data.t) + z - exp(z) 
+  # censor (indicator = 0)
+  log_survival <- log( exp(-exp(z)))                
+  # 對數Likelihood 總值
+  lj <- wts * data.censored * log_density + wts * (1 - data.censored) * (log_survival)
+  
+  return(-sum(lj))
+}
+```
+
+
+
+``` {r}
+# 建立一個函數來篩選特定應力水平的數據
+filter_by_stress <- function(stress, copper_data) {
+  idx <- copper_data$sigma == stress
+  list(
+    life = copper_data$cycles[idx],
+    cen = copper_data$censoring[idx],
+    wts = copper_data$censoring[idx],
+    x = log(copper_data$stress[idx])
+  )
+}
+results <- data.frame(
+  stress = stress.list,
+  lognormal_AIC = NA,
+  weibull_AIC = NA
+)
+
+stress.list <- unique(copper_data$stress)
+
+for(i in seq_along(stress.list)) {
+  stress <- stress.list[i]
+  filtered_data <- filter_by_stress(stress, copper_data)
+  
+  # 為不同分配設定不同的初始值
+  initial_lognormal <- c(log(100000), 0.4)
+  initial_weibull <- c(log(100000),0.4)  # 為 Weibull 設定不同的初始值
+  
+  if(stress == 7.25){  # 修正條件判斷
+    initial_lognormal <- c(3, 0.98)
+    initial_weibull <- c(6.6, 2.5)
+  }
+  
+  # 計算 lognormal
+  par.hat.lognormal <- optim(initial_lognormal, 
+                            fn = neg.log.likelihood.AR.lnor.twoparam, 
+                            data.t = filtered_data$life,
+                            data.censored = filtered_data$cen,
+                            wts = filtered_data$wts,
+                            x = filtered_data$x,
+                            hessian = TRUE)
+    
+  # 修正 AIC 計算：2k - 2ln(L)，k = 2
+  results$lognormal_AIC[i] <- 2 * 2 + 2 * par.hat.lognormal$value
+  results$param.lognormal.1[i] <- par.hat.lognormal$par[1]
+  results$param.lognormal.2[i] <- par.hat.lognormal$par[2]
+
+  # 計算 weibull
+  par.hat.weibull <- optim(initial_weibull,
+                          fn = neg.log.likelihood.AR.weibull.twoparam,  
+                          data.t = filtered_data$life,
+                          data.censored = filtered_data$cen,
+                          wts = filtered_data$wts,
+                          x = filtered_data$x,
+                          hessian = TRUE)
+    
+  results$weibull_AIC[i] <- 2 * 2 + 2 * par.hat.weibull$value
+  results$param.weibull.1[i] <- par.hat.weibull$par[1]
+  results$param.weibull.2[i] <- par.hat.weibull$par[2]
+
+}
+
+print(results)
+
+```
+
+
+## Hazard function  
+
+```{r}
+my_pnorm_simple <- function(z) {
+  # 使用簡單的 logistic 近似
+  1/(1 + exp(-1.702*z))
+}
+```
+
+```{r}
+my_pnorm <- function(z) {
+  # 使用梯形法則進行數值積分
+  integrate_gaussian <- function(x) {
+    1/sqrt(2*pi) * exp(-x^2/2)
+  }
+  
+  if(z < 0) {
+    # 負值的情況
+    dx <- 0.001
+    x_vals <- seq(z, 0, by=dx)
+    area <- sum(integrate_gaussian(x_vals)) * dx
+    return(0.5 - area)
+  } else {
+    # 正值的情況
+    dx <- 0.001
+    x_vals <- seq(0, z, by=dx)
+    area <- sum(integrate_gaussian(x_vals)) * dx
+    return(0.5 + area)
+  }
+}
+```
+
+```{r}
+library(ggplot2)
+library(patchwork) 
+
+hazard.funct.lognormal.line <- function(xpoint, mu, sigma) {
+  if(xpoint <= 0) return(0)
+  
+  log_x <- log(xpoint)
+  z <- (log_x - mu)/sigma
+  
+  pdf <- (1/(xpoint * sigma * sqrt(2*pi))) * exp(-(log_x - mu)^2/(2*sigma^2))
+  
+  cdf <- my_pnorm_simple(z)
+  threshold <- 1-1e-16  # 單一閾值
+  
+  if (cdf > threshold) {
+    #簡單但穩定的處理
+   cdf <- threshold
+  }
+  
+  surv <- 1 - cdf
+  hazard <- pdf/surv
+  return(hazard)
+}
+
+
+# 使用函數
+# 使用更密集且分布更合理的時間點
+# 在較小的時間值附近使用更密集的點
+time_points <- seq(1, 3000, by = 1) 
+
+plot_data_lognormal <- data.frame()
+
+# 計算危險函數值
+for(i in seq_along(stress.list)) {
+  mu <- results$param.lognormal.1[i]
+  sigma <- results$param.lognormal.2[i]
+  
+  hazard_values <- sapply(time_points, hazard.funct.lognormal.line, 
+                         mu = mu, sigma = sigma)
+  
+  temp_df <- data.frame(
+    time = time_points,
+    hazard = hazard_values,
+    stress = factor(stress.list[i])
+  )
+  
+  plot_data_lognormal <- rbind(plot_data_lognormal, temp_df)
+}
+
+```
+
+```{r}
+library(ggplot2)
+
+# 1. 定義韋伯危險函數 (Weibull Hazard Function)
+hazard.funct.weibull.line <- function(xpoint, mu, sigma) {
+  # 避免 xpoint 為 0 導致的計算錯誤
+  if (xpoint <= 0) return(0)
+  
+  eta = exp(mu)    # 尺度參數 (Scale)
+  beta = 1 / sigma # 形狀參數 (Shape)
+  
+  # 韋伯危險函數公式: (beta/eta) * (t/eta)^(beta-1)
+  hazard <- (beta / eta) * ((xpoint / eta)^(beta - 1))
+  return(hazard)
+}
+
+# 2. 準備模擬數據 (假設你有 stress.list 與對應的參數)
+# 這裡建立空 Data Frame
+plot_data_weibull <- data.frame()
+
+# 設定時間點：建議從 1 開始，避免 0 的數值問題
+# Pascual 論文中的循環數通常很大，範圍可參考 Table 1 [cite: 83]
+time_points <- seq(1, 3000, by = 1) 
+
+# 3. 執行迴圈計算
+for(i in seq_along(stress.list)) {
+  mu <- results$param.weibull.1[i]
+  sigma <- results$param.weibull.2[i]
+  
+  hazard_values <- sapply(time_points, hazard.funct.weibull.line, 
+                          mu = mu, sigma = sigma)
+  
+  temp_df <- data.frame(
+    time = time_points,
+    hazard = hazard_values,
+    stress = factor(stress.list[i])
+  )
+  
+  plot_data_weibull <- rbind(plot_data_weibull, temp_df)
+}
+
+```
+
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(scales) # 必須載入此套件處理標籤格式
+
+# --- 0. 設定統一參數 ---
+common_xlim <- c(0, exp(7.2))
+common_ylim <- c(0, 0.35)
+common_breaks <- c(10, 100,316.2277, 1000)
+legend_title <- "Stress Level" 
+
+# 定義標籤格式化函數：將數值轉為 10^k 形式
+# label_math(10^.x) 會將輸入的 .x 放在指數位置
+# 因為您的尺度是線性的，輸入值是 10, 100, 1000，所以要取 log10(.x)
+custom_log_labels <- label_math(10^.x)(log10(common_breaks))
+
+# --- 1. Log-normal 危險函數繪圖 ---
+p.lognormal <- ggplot(plot_data_lognormal, aes(x = time, y = hazard, color = stress)) +
+  geom_line(linewidth = 1) +
+  scale_color_viridis_d() +
+  labs(title = "Hazard functions of Log-normal",
+       x = "thousands of cycles",
+       y = "Hazard Rate",
+       color = legend_title) +
+  theme_minimal() +
+  # 修改重點：指定 breaks 並手動給予格式化後的 labels
+  scale_x_continuous(breaks = common_breaks, labels = label_math(10^.x)(log10(common_breaks))) +
+  coord_cartesian(xlim = common_xlim, ylim = common_ylim)+
+  theme(
+      text = element_text(size = 12),           # 基礎字體大小（全局設定）
+      
+      # --- 新增：調整軸數字字體大小 ---
+      #axis.text = element_text(size = 8),      # 同時調整 X 軸與 Y 軸數字的大小
+      axis.text.x = element_text(size = 8),  # 若只需單獨調整 X 軸數字，請取消此行註解
+      # axis.text.y = element_text(size = 10),  # 若只需單獨調整 Y 軸數字，請取消此行註解
+      
+      # --- 新增：調整軸標題（文字說明）大小 ---
+      #axis.title = element_text(size = 12),     # 調整如 "thousands of cycles" 或 "Hazard Rate" 的大小
+      
+      plot.title = element_text(
+        size = 12,        
+        face = "bold",    
+        hjust = 0.5       
+      ),
+      #plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+  )
+
+# --- 2. Weibull 危險函數繪圖 ---
+p.weibull <- ggplot(plot_data_weibull, aes(x = time, y = hazard, color = stress)) +
+  geom_line(linewidth = 1) +
+  scale_color_viridis_d() +  
+  labs(title = "Hazard functions of Weibull",
+       x = "thousands of cycles",
+       y = NULL, 
+       color = legend_title) +
+  theme_minimal() +
+  # 同步修改右圖
+  scale_x_continuous(breaks = common_breaks, labels = label_math(10^.x)(log10(common_breaks))) +
+  coord_cartesian(xlim = common_xlim, ylim = common_ylim)+
+  theme(
+      text = element_text(size = 12),           # 基礎字體大小（全局設定）
+      
+      # --- 新增：調整軸數字字體大小 ---
+      #axis.text = element_text(size = 8),      # 同時調整 X 軸與 Y 軸數字的大小
+      axis.text.x = element_text(size = 8),  # 若只需單獨調整 X 軸數字，請取消此行註解
+      # axis.text.y = element_text(size = 10),  # 若只需單獨調整 Y 軸數字，請取消此行註解
+      
+      # --- 新增：調整軸標題（文字說明）大小 ---
+      #axis.title = element_text(size = 12),     # 調整如 "thousands of cycles" 或 "Hazard Rate" 的大小
+      
+      plot.title = element_text(
+        size = 12,        
+        face = "bold",    
+        hjust = 0.5       
+      ),
+      #plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+  )
+
+# --- 3. 併圖 ---
+combined_plot <- p.lognormal + p.weibull + 
+  plot_layout(guides = "collect") 
+
+print(combined_plot)
+```
+
+
+
+# Probability Plot 
+
+```{r}
+library(ggplot2)
+
+# 建立繪圖函數
+plot_lognormal_probability <- function(copper_data, stress.list, results) {
+  # 儲存所有數據點
+  plot_data <- data.frame()
+  theoretical_lines <- data.frame()
+  
+  for(i in seq_along(stress.list)) {
+    stress <- stress.list[i]
+    filtered_data <- filter_by_stress(stress, copper_data)
+    
+    # 計算經驗累積機率（使用median rank）
+    n <- length(filtered_data$life)
+    ranks <- rank(filtered_data$life)
+    prob <- (ranks - 0.3) / (n + 0.4)
+    
+    # 儲存實際數據點
+    plot_data <- rbind(plot_data, data.frame(
+      cycles = filtered_data$life,
+      prob = prob,
+      stress = as.factor(stress)
+    ))
+    
+    # 生成理論線
+    mu <- results$param.lognormal.1[i]
+    sigma <- results$param.lognormal.2[i]
+    theoretical_x <- seq(min(filtered_data$life)-1500*exp(-stress), max(filtered_data$life)+2000*exp(-stress), length.out = 100)
+    theoretical_prob <- plnorm(theoretical_x, meanlog = mu, sdlog = sigma)
+    
+    theoretical_lines <- rbind(theoretical_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob,
+      stress = as.factor(stress)
+    ))
+  }
+  
+  # 繪製圖形
+   ggplot() +
+    geom_point(data = plot_data, aes(x = cycles, y = prob, color = stress), size = 1.5) +
+    geom_line(data = theoretical_lines, aes(x = cycles, y = prob, color = stress),linewidth = 1.0) +
+    scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+    scale_y_continuous(trans = "probit",
+                      breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                               0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+                      labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                               "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")) +
+    labs(title = "Lognormal Probability Plot",
+       x = "thousands of cycles",
+       y = "Probability of Failure", # 移除右圖 Y 軸標題，避免擠壓空間
+       color = legend_title) +
+    theme_bw()+
+    theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+}
+# 使用函數
+p_new1_log <- plot_lognormal_probability(copper_data, stress.list, results)
+p_new1_log
+```
+
+
+
+
+
+
+
+
+```{r}
+library(scales)
+
+# 定義韋伯轉換函數
+weibull_trans <- function() {
+  trans_new(
+    "weibull",
+    transform = function(p) log(-log(1-p)),  # 韋伯轉換
+    inverse = function(x) 1 - exp(-exp(x)),  # 反轉換
+    domain = c(0, 1)
+  )
+}
+
+# 修改繪圖函數
+plot_weibull_probability <- function(copper_data, stress.list, results) {
+  # 儲存所有數據點
+  plot_data <- data.frame()
+  theoretical_lines <- data.frame()
+  
+  for(i in seq_along(stress.list)) {
+    stress <- stress.list[i]
+    filtered_data <- filter_by_stress(stress, copper_data)
+    
+    # 計算經驗累積機率
+    n <- length(filtered_data$life)
+    ranks <- rank(filtered_data$life)
+    prob <- (ranks - 0.3) / (n + 0.4)
+    
+    # 儲存實際數據點
+    plot_data <- rbind(plot_data, data.frame(
+      cycles = filtered_data$life,  # 不預先取對數
+      prob = prob,
+      stress = as.factor(stress)
+    ))
+    
+    # 生成理論線
+    mu <- results$param.weibull.1[i]
+    sigma <- results$param.weibull.2[i]
+    
+    # 生成理論線的 x 值
+    theoretical_x <- seq(min(filtered_data$life)-150000*exp(-stress), max(filtered_data$life)+150000*exp(-stress), length.out = 100)
+
+    
+    # 計算理論機率
+    theoretical_prob <- 1 - exp(-exp((log(theoretical_x) - mu)/sigma))
+    
+    theoretical_lines <- rbind(theoretical_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob,
+      stress = as.factor(stress)
+    ))
+  }
+  
+  # 繪製圖形
+  ggplot() +
+    geom_point(data = plot_data, aes(x = cycles, y = prob, color = stress), size = 1.5) +
+    geom_line(data = theoretical_lines, aes(x = cycles, y = prob, color = stress),linewidth = 1.0) +
+
+    scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+    scale_y_continuous(
+      trans = weibull_trans(),  # 使用自定義的韋伯轉換
+      breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+      labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")) +
+    labs(title = "Weibull Probability Plot",
+       x = "thousands of cycles",
+       y = NULL, # 移除右圖 Y 軸標題，避免擠壓空間
+       color = legend_title) +
+    theme_bw()+
+    theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+}
+p_new1_wei <- plot_weibull_probability(copper_data, stress.list, results)
+p_new1_wei
+```
+
+```{r}
+# --- 3. 併圖並統一圖例與佈局 ---
+# 使用 & 運算子可以同時修改兩張圖的 theme
+combined_plot <- p_new1_log + p_new1_wei + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "right")
+
+# 顯示結果
+combined_plot
+```
+```{r}
+library(ggplot2)
+library(patchwork)
+
+# 設定特定的刻度值
+specific_breaks <- c(27, 22.5, 19, 16, 13.5, 11.7, 10, 9.25, 8.25, 7.25)
+
+p1 <- ggplot(results, aes(x = log(stress), y = param.lognormal.1)) +
+  geom_point(color = "blue", size = 1.5, alpha = 0.7) +
+  scale_x_continuous(
+    breaks = log(specific_breaks),  # 使用特定的對數值作為刻度位置
+    labels = specific_breaks  # 使用原始數值作為標籤
+  ) +
+  labs(title = "Log-normal Distribution μ",
+       y = "location parameter ( μ )",
+       x = "stress")+
+  theme_minimal()+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+p2 <- ggplot(results, aes(x = log(stress), y = param.weibull.1)) +
+  geom_point(color = "blue", size = 1.5, alpha = 0.7) +
+  scale_x_continuous(
+    breaks = log(specific_breaks),  # 使用特定的對數值作為刻度位置
+    labels = specific_breaks  # 使用原始數值作為標籤
+  ) +
+  labs(title = "Weibull Distribution μ",
+       y = NULL,
+       x = "stress")+
+  theme_minimal()+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+
+combined_plot <- p1 + p2 + 
+  plot_layout(guides = "collect")# 顯示結果
+combined_plot
+```
+```{r}
+library(ggplot2)
+library(patchwork)
+
+# 設定特定的刻度值
+specific_breaks <- c(27, 22.5, 19, 16, 13.5, 11.7, 10, 9.25, 8.25, 7.25)
+
+p3 <- ggplot(results, aes(y = param.lognormal.2, x = log(stress))) +  # 互換 x 和 y
+  geom_point(color = "blue", size = 1.5, alpha = 0.7) +
+  scale_x_continuous(
+    breaks = log(specific_breaks),  
+    labels = specific_breaks  
+  ) +
+  labs(title = "Log-normal distribution σ",
+       y = "Scale Parameter ( σ )",
+       x = "Stress")+
+  theme_minimal()+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+
+p4 <- ggplot(results, aes(y = param.weibull.2, x = log(stress))) +  # 互換 x 和 y
+  geom_point(color = "blue", size = 1.5, alpha = 0.7) +
+  scale_x_continuous(
+    breaks = log(specific_breaks),  
+    labels = specific_breaks  
+  ) +
+  labs(title = "Weibull distribution σ",
+       y = NULL,
+       x = "Stress")+
+  theme_minimal()+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+combined_plot <- p3 + p4 + 
+  plot_layout(guides = "collect")
+# 顯示結果
+combined_plot
+```
+
+
+
+```{r}
+library(ggplot2)
+library(patchwork) 
+library(latex2exp) # 核心套件
+
+weibull_data <- (results$param.weibull.2)^2
+lognormal_data <- (results$param.lognormal.2)^2
+
+
+
+p5 <- ggplot(data.frame(x = lognormal_data), aes(x = x)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 bins = 8,  
+                 fill = "steelblue", 
+                 color = "black", 
+                 alpha = 0.7) +
+  geom_density(color = "red", linewidth = 1) +
+  # 使用 TeX() 函數轉換 LaTeX 語法
+  labs(title = "Histogram of Log-normal ( σ² )",
+       x = "Square of Shape parameter ( σ² )",
+       y = "Density") +
+  theme_minimal() +
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+
+
+p6<-ggplot(data.frame(x = weibull_data), aes(x = x)) +
+  geom_histogram(aes(y = after_stat(density)), # 使用新的語法
+                 bins = 8,  
+                 fill = "steelblue", 
+                 color = "black", 
+                 alpha = 0.7) +
+  geom_density(color = "red", size = 1) +
+  labs(title = "Histogram of Log-normal ( σ² )",
+       x = "Square of Shape parameter ( σ² )",
+       y = NULL) +
+  theme_minimal()+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+combined_plot <- p5 + p6 + 
+  plot_layout(guides = "collect")
+# 顯示結果
+combined_plot
+```
+
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(latex2exp)
+weibull_data <- (results$param.weibull.2)^(-2)
+lognormal_data <- (results$param.lognormal.2)^(-2)
+
+# --- p5: Log-normal ---
+p5 <- ggplot(data.frame(x = lognormal_data), aes(x = x)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 bins = 8,  
+                 fill = "steelblue", 
+                 color = "black", 
+                 alpha = 0.7) +
+  geom_density(color = "red", linewidth = 1) + # 統一使用 linewidth
+  labs(title = "Log-normal Distribution ( 1/ σ² )",
+       x = "Inverse Square of Shape parameter ( 1/ σ² )",
+       y = "Density")+
+  theme_minimal()+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+
+# --- p6: Weibull ---
+p6 <- ggplot(data.frame(x = weibull_data), aes(x = x)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 bins = 8,  
+                 fill = "steelblue", 
+                 color = "black", 
+                 alpha = 0.7) +
+  geom_density(color = "red", linewidth = 1) + 
+  labs(title = "Weibull Distribution ( 1/ σ² )", # 修正為 Weibull
+       x ="Inverse Square of Shape parameter ( 1/ σ² )",
+       y = NULL)+ # 右圖隱藏 Y 軸標題以節省空間
+  theme_minimal()+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+
+combined_plot <- p5 + p6 + 
+  plot_layout(guides = "collect")
+# 顯示結果
+combined_plot
+```
+

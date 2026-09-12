@@ -1,0 +1,3537 @@
+---
+title: "fatigue life analysis"
+author: "謝柏陞"
+date: "2025-01-23"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+documentclass: ctexart
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  dev = "png",         
+  dpi = 300,           
+  fig.retina = 2,      
+  
+  # --- 新增/修改圖片大小控制 ---
+  fig.width = 8,         # 增加畫布寬度，適合並排圖表
+  fig.height = 5,        # 設定畫布高度
+  # fig.asp = 0.618,     # 或者使用長寬比，兩者擇一即可
+  
+  out.width = "90%",     # 稍微縮小顯示比例，留點邊界美感
+  fig.align = "center"   # 讓圖片置中
+)
+```
+
+```{r}
+copper_data <- data %>%
+  mutate(
+    sigma = as.numeric(stress),
+    # 偵測 "Censoring Indicator" 欄位，若是 "Failed" 則為 1，否則為 0
+    censoring = ifelse(`censoring` == "Failed", 1, 0)
+  )
+
+```
+
+
+## 
+```{r}
+library(tidyverse)
+
+# 讀取 CSV 檔案
+data <- read_csv("fatigue_demo_data.csv")
+
+# 如果 CSV 已經是長格式（有 sigma, cycle, censoring 欄位）
+# 修改後的資料處理部分
+
+# 2. 修改後的資料處理部分：只要 sigma 存在，則 censoring = 1
+copper_data <- data %>%
+  mutate(
+    sigma = as.numeric(stress),
+    # 使用 !is.na() 檢查 sigma 是否有值，若有值則為 1，否則為 0
+    # 這會將所有具有應力紀錄的觀測點標記為「已失效」
+    censoring = if_else(!is.na(sigma), 1, 0)
+  )
+copper_data <- data %>%
+  mutate(
+    sigma = as.numeric(stress),
+    # 偵測 "Censoring Indicator" 欄位，若是 "Failed" 則為 1，否則為 0
+    censoring = ifelse(`censoring` == 1, 1, 0)
+  )
+
+# 查看結果
+copper_data
+stress.list <- unique(copper_data$sigma)
+```
+## 數據處理
+此處模型是用$$\mu=\beta_0+\beta_1*x_i+ \sigma_N\quad x_i=log(S_e) \ ,\quad \sigma_N$$
+
+```{r}
+life <- copper_data$cycles
+life.log<-log(life)
+cen<-copper_data$censoring
+wts<-copper_data$censoring
+
+Stress.Amplitude <- copper_data$sigma
+x <- log(Stress.Amplitude)  #log 化
+
+```
+
+## 初步繪圖
+
+```{r}
+library(scales)
+
+ggplot(copper_data, aes(x = cycles, y = stress)) +
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+      scale_shape_manual(
+        values = c("0" = 2, "1" = 16),
+        labels = c("0" = "Runout", "1" = "Failure"),
+        name = "Status"
+      ) +
+# 修改後的座標軸部分
+  scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+  
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+    labs(
+    title = " S-N diagram for annealed electrolytic copper wire",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+  theme_minimal()+
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(
+        size = 12,        
+        face = "bold",    
+        hjust = 0.5       
+      ),
+    legend.position = "right"
+  )
+```
+
+## model 1  without fatigue limit  
+
+```{r}
+# 修正的 Weibull 負對數似然函數
+neg.log.likelihood.AR.weibull <- function(par, data.t, data.censored, wts, Stress.Amplitude){
+
+  
+  mu <- par[2] * log(Stress.Amplitude) + par[1]
+  sigma <- par[3]
+  z <- (log(data.t) - mu) / sigma
+  
+  log_density <- -log(sigma) - log(data.t) + z - exp(z) 
+  log_survival <- log(exp(-exp(z)))
+  
+  lj <- wts * data.censored * log_density + wts * (1 - data.censored) * log_survival
+  
+  result <- -sum(lj)
+  
+  # 檢查結果是否有限
+  if(!is.finite(result)) {
+    return(1e10)
+  }
+  
+  return(result)
+}
+
+# 修正的 Lognormal 負對數似然函數
+neg.log.likelihood.AR.lnor <- function(par, data.t, data.censored, wts, Stress.Amplitude){
+
+  mu <- par[2] * log(Stress.Amplitude) + par[1]
+  sigma <- par[3]
+  
+  lj <- wts * data.censored * dlnorm(data.t, mu, sigma, log = TRUE) + 
+        wts * (1 - data.censored) * log(1 - plnorm(data.t, mu, sigma))
+  
+  result <- -sum(lj)
+  
+  # 檢查結果是否有限
+  if(!is.finite(result)) {
+    return(1e10)
+  }
+  
+  return(result)
+}
+```
+
+
+```{r}
+
+# 計算應力範圍
+min_stress <- min(Stress.Amplitude)
+max_stress <- max(Stress.Amplitude)
+
+# 設置合理的初始值
+initial <- c(15.548962 , -1.318422 , 3)
+
+# 設置參數界限
+lower_bounds <- c(-Inf, -Inf, 0.01)
+upper_bounds <- c(Inf, Inf, Inf )  # par[4] 必須小於最小應力值
+
+cat("應力範圍:", min_stress, "到", max_stress, "\n")
+cat("初始值 par[4]:", initial[4], "\n")
+cat("約束條件: par[4] <", min_stress - 0.001, "\n\n")
+
+# 最佳化 Lognormal 模型
+par.hat.lognormal.model1.nofatigue.limit <- optim(initial, neg.log.likelihood.AR.lnor, 
+                          data.t = life, data.censored = cen, wts = wts, 
+                          Stress.Amplitude = Stress.Amplitude,
+                          method = "L-BFGS-B",
+                          lower = lower_bounds,
+                          upper = upper_bounds,
+                          hessian = TRUE,
+                          control = list(trace = 1))
+
+par.lognormal <- par.hat.lognormal.model1.nofatigue.limit$par
+
+# 最佳化 Weibull 模型
+par.hat.weibull.model1.nofatigue.limit <- optim(initial, neg.log.likelihood.AR.weibull, 
+                        data.t = life, data.censored = cen, wts = wts, 
+                        Stress.Amplitude = Stress.Amplitude,
+                        method = "L-BFGS-B",
+                        lower = lower_bounds,
+                        upper = upper_bounds,
+                        hessian = TRUE,
+                        control = list(trace = 1))  # 顯示最佳化過程
+
+par.weibull <- par.hat.weibull.model1.nofatigue.limit$par
+
+
+```
+
+```{r}
+df <- data.frame(
+  Distribution = c("Lognormal", "Weibull"),
+  AIC = c(2 * length(par.hat.lognormal.model1.nofatigue.limit$par) + 2 * par.hat.lognormal.model1.nofatigue.limit$value, 
+          2 * length(par.hat.weibull.model1.nofatigue.limit$par) + 2 * par.hat.weibull.model1.nofatigue.limit$value),
+  mu.beta.0 = c(par.hat.lognormal.model1.nofatigue.limit$par[1], par.hat.weibull.model1.nofatigue.limit$par[1]),
+  mu.beta.1 = c(par.hat.lognormal.model1.nofatigue.limit$par[2], par.hat.weibull.model1.nofatigue.limit$par[2]),
+  sigma= c(par.hat.lognormal.model1.nofatigue.limit$par[3], par.hat.weibull.model1.nofatigue.limit$par[3])
+)
+
+print(df)
+```
+
+# model 1 繪圖
+```{r}
+Fatigue.life.quantile.lognormal<-function(par,p,stress){
+  location <- par[2]*log(stress) + par[1]
+  
+  # 計算分位數
+  quantile=qnorm(p, mean = 0, sd = 1)
+  return(quantile*par[3]+location)
+}
+Fatigue.life.quantile.weibull<-function(par,p,stress){
+  location <- par[2]*log(stress) + par[1]
+  mu <- 0      #標準化SEV 的location
+  sigma <- 1   # scale
+  
+  # 計算分位數
+  quantile <-log(-log(1-p))
+  return(quantile*par[3]+location)
+}
+```
+
+            
+
+```{r}
+## 繪製圖型
+# 創建分位數線的數據
+stress_range <- seq(min(copper_data$stress), max(copper_data$stress), length.out = 100)
+
+# 0.5 分位數線的數據
+line_data_50.lognormal.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.lognormal(par.lognormal, 0.5, x)))
+)
+
+# 0.1 分位數線的數據
+line_data_10.lognormal.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.lognormal(par.lognormal, 0.1, x)))
+)
+line_data_1.lognormal.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.lognormal(par.lognormal, 0.01, x)))
+)
+# 0.9 分位數線的數據
+line_data_90.lognormal.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.lognormal(par.lognormal, 0.9, x)))
+)
+
+
+
+# 0.5 分位數線的數據
+line_data_50.weibull.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.weibull(par.weibull, 0.5, x)))
+)
+
+# 0.1 分位數線的數據
+line_data_10.weibull.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.weibull(par.weibull, 0.1, x)))
+)
+line_data_1.weibull.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.weibull(par.weibull, 0.01, x)))
+)
+
+# 0.9 分位數線的數據
+line_data_90.weibull.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.weibull(par.weibull, 0.9, x)))
+)
+
+
+#繪圖
+ggplot(copper_data, aes(x = cycles, y = stress)) + # [修正1] 這裡直接用原始變數，不要加 log()
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(
+    values = c("0" = 2, "1" = 16),
+    labels = c("0" = "Runout", "1" = "Failure"),
+    name = "Status"
+  ) +
+    # [修正2] 下面的 geom_line 全部都要改回原始變數 x = cycles, y = sigma
+  # lognormal 分位數線 (實線)
+  geom_line(data = line_data_50.lognormal.model1, 
+            aes(x = cycles, y = sigma, color = "50%", linetype = "Lognormal"), # 去掉 log()
+            linewidth = 1) +
+  geom_line(data = line_data_10.lognormal.model1, 
+            aes(x = cycles, y = sigma, color = "10%", linetype = "Lognormal"), # 去掉 log()
+            linewidth = 1) +
+  geom_line(data = line_data_90.lognormal.model1, 
+            aes(x = cycles, y = sigma, color = "90%", linetype = "Lognormal"), # 去掉 log()
+            linewidth = 1) +
+  
+  # weibull 分位數線 (虛線)
+  geom_line(data = line_data_50.weibull.model1, 
+            aes(x = cycles, y = sigma, color = "50%", linetype = "Weibull"),   # 去掉 log()
+            linewidth = 1) +
+  geom_line(data = line_data_10.weibull.model1, 
+            aes(x = cycles, y = sigma, color = "10%", linetype = "Weibull"),   # 去掉 log()
+            linewidth = 1) +
+  geom_line(data = line_data_90.weibull.model1, 
+            aes(x = cycles, y = sigma, color = "90%", linetype = "Weibull"),   # 去掉 log()
+            linewidth = 1) +
+  scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+  
+  # Y 軸：讓 ggplot 負責轉 log
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  
+
+
+  scale_color_manual(
+    values = c("10%" = "green", "50%" = "red", "90%" = "purple", "1%"="gray")
+  ) +
+  scale_linetype_manual(
+    values = c("Lognormal" = "solid", "Weibull" = "dashed")
+  ) +
+  
+  labs(
+    title = "S-N diagram of Model 1 for nickel-based superalloy specimens",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+theme_minimal() +
+theme(
+   text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+   # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+   plot.title = element_text(
+     size = 12,        # 設定標題字體大小 (例如 20)
+     face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+     hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+   ),
+   
+   legend.position = "right"
+ )
+```
+
+
+## model 1 probability plot 
+
+* log normal 
+```{r}
+library(ggplot2)
+# 建立一個函數來篩選特定應力水平的數據
+filter_by_stress <- function(stress, copper_data) {
+  idx <- copper_data$sigma == stress
+  list(
+    life = copper_data$cycles[idx],
+    cen = copper_data$censoring[idx],
+    wts = copper_data$censoring[idx],
+    x = log(copper_data$stress[idx])
+  )
+}
+
+# 建立繪圖函數
+plot_lognormal_probability <- function(copper_data, stress.list, results) {
+  # 儲存所有數據點
+  plot_data <- data.frame()
+  theoretical_lines <- data.frame()
+  
+  for(i in seq_along(stress.list)) {
+    stress <- stress.list[i]
+    filtered_data <- filter_by_stress(stress, copper_data)
+    
+    # 計算經驗累積機率（使用median rank）
+    n <- length(filtered_data$life)
+    ranks <- rank(filtered_data$life)
+    prob <- (ranks - 0.3) / (n + 0.4)
+    
+    mu.beta.0 = par.hat.lognormal.model1.nofatigue.limit$par[1]
+    mu.beta.1 = par.hat.lognormal.model1.nofatigue.limit$par[2]
+    sigma= par.hat.lognormal.model1$par[3]
+
+    sorted_life <- sort(filtered_data$life)  # 先排序
+    prob <- (1:n - 0.3) / (n + 0.4)         # 順序機率
+    plot_data <- rbind(plot_data, data.frame(
+    cycles = sorted_life,  # 已排序
+    prob = prob,           # 對應機率
+    stress = as.factor(stress)
+    ))
+    
+    # 生成理論線
+    mu <- mu.beta.0 + mu.beta.1 * log(stress)
+    
+    theoretical_x <- seq(min(filtered_data$life)-0.05, max(filtered_data$life)+0.5, length.out = 100)
+    
+    theoretical_prob <- plnorm(theoretical_x, meanlog = mu, sdlog = sigma)
+    
+    theoretical_lines <- rbind(theoretical_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob,
+      stress = as.factor(stress)
+    ))
+  }
+  
+  # 繪製圖形
+   ggplot() +
+    geom_point(data = plot_data, aes(x = cycles, y = prob, color = stress),size=1.5) +
+    geom_line(data = theoretical_lines, aes(x = cycles, y = prob, color = stress),linewidth = 1) +
+    scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+    scale_y_continuous(trans = "probit",
+                      breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                               0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+                      labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                               "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")) +
+    xlab("thousands of cycles") +
+    ylab("Fraction failing") +
+    theme_bw() +
+    theme(legend.position = "none")+
+    ggtitle("Lognormal Probability Plot")
+}
+# 使用函數
+stress.list <- unique(copper_data$sigma)
+
+p_new1_log <- plot_lognormal_probability(copper_data, stress.list, results)
+p_new1_log
+```
+
+
+
+* weibull 
+
+```{r}
+library(scales)
+
+# 定義韋伯轉換函數
+weibull_trans <- function() {
+  trans_new(
+    "weibull",
+    transform = function(p) log(-log(1-p)),  # 韋伯轉換
+    inverse = function(x) 1 - exp(-exp(x)),  # 反轉換
+    domain = c(0, 1)
+  )
+}
+
+# 修改繪圖函數
+plot_weibull_probability <- function(copper_data, stress.list, results) {
+  # 儲存所有數據點
+  plot_data <- data.frame()
+  theoretical_lines <- data.frame()
+  
+  for(i in seq_along(stress.list)) {
+    stress <- stress.list[i]
+    filtered_data <- filter_by_stress(stress, copper_data)
+    
+    # 計算經驗累積機率
+    n <- length(filtered_data$life)
+    ranks <- rank(filtered_data$life)
+    prob <- (ranks - 0.3) / (n + 0.4)
+    
+    sorted_life <- sort(filtered_data$life)  # 先排序
+    prob <- (1:n - 0.3) / (n + 0.4)         # 順序機率
+    plot_data <- rbind(plot_data, data.frame(
+    cycles = sorted_life,  # 已排序
+    prob = prob,           # 對應機率
+    stress = as.factor(stress)
+    ))
+    
+    # 生成理論線
+    
+    mu.beta.0 = par.hat.weibull.model1$par[1]
+    mu.beta.1 = par.hat.weibull.model1$par[2]
+    sigma= par.hat.weibull.model1$par[3]
+
+    mu<-mu.beta.0 + mu.beta.1 * log(stress)
+    # 生成理論線的 x 值
+    theoretical_x <- seq(min(filtered_data$life), 
+                        max(filtered_data$life), 
+                        length.out = 100)
+    
+    # 計算理論機率
+    theoretical_prob <- 1 - exp(-exp((log(theoretical_x) - mu)/sigma))
+    
+    theoretical_lines <- rbind(theoretical_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob,
+      stress = as.factor(stress)
+    ))
+  }
+  
+  # 繪製圖形
+  ggplot() +
+    geom_point(data = plot_data, aes(x = cycles, y = prob, color = stress),size=1.5) +
+    geom_line(data = theoretical_lines, aes(x = cycles, y = prob, color = stress),linewidth = 1) +
+    scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+    scale_y_continuous(
+      trans = weibull_trans(),  # 使用自定義的韋伯轉換
+      breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+      labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")) +
+    xlab("thousands of cycles") +
+    ylab("Fraction failing") +
+    theme_bw() +
+    ggtitle("Weibull Probability Plot")
+}
+p_new1_wei <- plot_weibull_probability(copper_data, stress.list, results)
+p_new1_wei
+```
+```{r}
+
+library(scales)
+
+# 合併兩個模型的繪圖函數（可調整粗細版本）
+plot_combined_probability <- function(copper_data, stress.list, 
+                                     par.hat.lognormal, par.hat.weibull,
+                                     y_trans = "probit",
+                                     point_size = 1.5,      # 點的大小
+                                     line_width = 1.0) {    # 線的粗細
+  
+  plot_data <- data.frame()
+  lognormal_lines <- data.frame()
+  weibull_lines <- data.frame()
+  
+  for(i in seq_along(stress.list)) {
+    stress <- stress.list[i]
+    filtered_data <- filter_by_stress(stress, copper_data)
+    
+    # 計算經驗累積機率
+    n <- length(filtered_data$life)
+    sorted_life <- sort(filtered_data$life)
+    prob <- (1:n - 0.3) / (n + 0.4)
+    
+    plot_data <- rbind(plot_data, data.frame(
+      cycles = sorted_life,
+      prob = prob,
+      stress = as.factor(stress)
+    ))
+    
+    # === Lognormal 理論線 ===
+    mu.beta.0.ln <- par.hat.lognormal.model1.nofatigue.limit$par[1]
+    mu.beta.1.ln <- par.hat.lognormal.model1.nofatigue.limit$par[2]
+    sigma.ln <- par.hat.lognormal.model1.nofatigue.limit$par[3]
+
+    mu.ln <- mu.beta.0.ln + mu.beta.1.ln * log(stress)
+    
+    theoretical_x <- seq(min(filtered_data$life) * 0.8, 
+                        max(filtered_data$life) * 1.2, 
+                        length.out = 200)
+    
+    theoretical_prob.ln <- plnorm(theoretical_x, meanlog = mu.ln, sdlog = sigma.ln)
+    
+    lognormal_lines <- rbind(lognormal_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob.ln,
+      stress = as.factor(stress)
+    ))
+    
+    # === Weibull 理論線 ===
+    mu.beta.0.wb <- par.hat.weibull.model1.nofatigue.limit$par[1]
+    mu.beta.1.wb <- par.hat.weibull.model1.nofatigue.limit$par[2]
+    sigma.wb <- par.hat.weibull.model1.nofatigue.limit$par[3]
+
+    mu.wb <- mu.beta.0.wb + mu.beta.1.wb * log(stress)
+    
+    theoretical_prob.wb <- 1 - exp(-exp((log(theoretical_x) - mu.wb) / sigma.wb))
+    
+    weibull_lines <- rbind(weibull_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob.wb,
+      stress = as.factor(stress)
+    ))
+  }
+  
+  # 繪製圖形
+  p <- ggplot() +
+    # 實際數據點 - 使用 point_size 參數
+    geom_point(data = plot_data, 
+               aes(x = cycles, y = prob, color = stress),
+               size = point_size) +
+    # Lognormal 實線 - 使用 line_width 參數
+    geom_line(data = lognormal_lines, 
+              aes(x = cycles, y = prob, color = stress),
+              linewidth = line_width,
+              linetype = "solid") +
+    # Weibull 虛線 - 使用 line_width 參數
+    geom_line(data = weibull_lines, 
+              aes(x = cycles, y = prob, color = stress),
+              linewidth = line_width,
+              linetype = "dashed") +
+    scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+    xlab("thousands of cycles") +
+    ylab("probability") +
+    theme_bw() +
+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+  # 根據選擇的座標系統添加 y 軸轉換
+  if(y_trans == "probit") {
+    p <- p + 
+      scale_y_continuous(
+        trans = "probit",
+        breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                   0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+        labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                   "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")
+      ) +
+      ggtitle("Probability Plot (Probit Scale) of Model 1 for annealed electrolytic copper wire",
+              subtitle = "Solid: Lognormal | Dashed: Weibull")
+  } else {
+    p <- p + 
+      scale_y_continuous(
+        trans = weibull_trans(),
+        breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                   0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+        labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                   "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")
+      ) +
+      ggtitle("Probability Plot (Weibull Scale) of Model 1 for annealed electrolytic copper wire",
+              subtitle = "Solid: Lognormal | Dashed: Weibull")
+    
+  }
+  
+  return(p)
+}
+
+# === 使用範例：不同粗細組合 ===
+
+# 1. 預設大小
+p1 <- plot_combined_probability(
+  copper_data, stress.list, 
+  par.hat.lognormal.model1, par.hat.weibull.model1,
+  y_trans = "weibull",
+  point_size = 1.5,    # 預設
+  line_width = 1.0     # 預設
+)
+
+print(p1)
+```
+
+
+## model 1  with fatigue limit 
+
+```{r}
+# 修正的 Weibull 負對數似然函數
+neg.log.likelihood.AR.weibull <- function(par, data.t, data.censored, wts, Stress.Amplitude){
+  min_stress <- min(Stress.Amplitude)
+  
+  # 約束條件：par[4] < min(Stress.Amplitude) 且 sigma > 0
+  if(par[4] >= min_stress || par[3] <= 0) {
+    return(1e10)
+  }
+  
+  # 確保 Stress.Amplitude - par[4] 都為正數
+  stress_diff <- Stress.Amplitude - par[4]
+  if(any(stress_diff <= 0)) {
+    return(1e10)
+  }
+  
+  mu <- par[2] * log(stress_diff) + par[1]
+  sigma <- par[3]
+  z <- (log(data.t) - mu) / sigma
+  
+  log_density <- -log(sigma) - log(data.t) + z - exp(z) 
+  log_survival <- log(exp(-exp(z)))
+  
+  lj <- wts * data.censored * log_density + wts * (1 - data.censored) * log_survival
+  
+  result <- -sum(lj)
+  
+  # 檢查結果是否有限
+  if(!is.finite(result)) {
+    return(1e10)
+  }
+  
+  return(result)
+}
+
+# 修正的 Lognormal 負對數似然函數
+neg.log.likelihood.AR.lnor <- function(par, data.t, data.censored, wts, Stress.Amplitude){
+  min_stress <- min(Stress.Amplitude)
+  
+  # 約束條件：par[4] < min(Stress.Amplitude) 且 sigma > 0
+  if(par[4] >= min_stress || par[3] <= 0) {
+    return(1e10)
+  }
+  
+  # 確保 Stress.Amplitude - par[4] 都為正數
+  stress_diff <- Stress.Amplitude - par[4]
+  if(any(stress_diff <= 0)) {
+    return(1e10)
+  }
+  
+  mu <- par[2] * log(stress_diff) + par[1]
+  sigma <- par[3]
+  
+  lj <- wts * data.censored * dlnorm(data.t, mu, sigma, log = TRUE) + 
+        wts * (1 - data.censored) * log(1 - plnorm(data.t, mu, sigma))
+  
+  result <- -sum(lj)
+  
+  # 檢查結果是否有限
+  if(!is.finite(result)) {
+    return(1e10)
+  }
+  
+  return(result)
+}
+```
+
+
+```{r}
+
+# 計算應力範圍
+min_stress <- min(Stress.Amplitude)
+max_stress <- max(Stress.Amplitude)
+
+# 設置合理的初始值
+initial <- c(6.548962 , -1.318422 , 0.5, min_stress-1)
+
+# 設置參數界限
+lower_bounds <- c(-Inf, -Inf, 0.01, -Inf)
+upper_bounds <- c(Inf, Inf, Inf, min_stress - 0.001)  # par[4] 必須小於最小應力值
+
+cat("應力範圍:", min_stress, "到", max_stress, "\n")
+cat("初始值 par[4]:", initial[4], "\n")
+cat("約束條件: par[4] <", min_stress - 0.001, "\n\n")
+
+# 最佳化 Lognormal 模型
+par.hat.lognormal.model1 <- optim(initial, neg.log.likelihood.AR.lnor, 
+                          data.t = life, data.censored = cen, wts = wts, 
+                          Stress.Amplitude = Stress.Amplitude,
+                          method = "L-BFGS-B",
+                          lower = lower_bounds,
+                          upper = upper_bounds,
+                          hessian = TRUE,
+                          control = list(trace = 1))
+
+par.lognormal <- par.hat.lognormal.model1$par
+
+# 最佳化 Weibull 模型
+par.hat.weibull.model1 <- optim(initial, neg.log.likelihood.AR.weibull, 
+                        data.t = life, data.censored = cen, wts = wts, 
+                        Stress.Amplitude = Stress.Amplitude,
+                        method = "L-BFGS-B",
+                        lower = lower_bounds,
+                        upper = upper_bounds,
+                        hessian = TRUE,
+                        control = list(trace = 1))  # 顯示最佳化過程
+
+par.weibull <- par.hat.weibull.model1$par
+
+
+```
+```{r}
+df <- data.frame(
+  Distribution = c("Lognormal", "Weibull"),
+  AIC = c(2 * 4 + 2 * par.hat.lognormal.model1$value, 
+          2 * 4 + 2 * par.hat.weibull.model1$value),
+  mu.beta.0 = c(par.hat.lognormal.model1$par[1], par.hat.weibull.model1$par[1]),
+  mu.beta.1 = c(par.hat.lognormal.model1$par[2], par.hat.weibull.model1$par[2]),
+  sigma= c(par.hat.lognormal.model1$par[3], par.hat.weibull.model1$par[3]),
+  gamma=c(par.hat.lognormal.model1$par[4], par.hat.weibull.model1$par[4])
+
+)
+
+print(df)
+```
+
+# model 1 繪圖
+```{r}
+Fatigue.life.quantile.lognormal<-function(par,p,stress){
+  location <- par[2]*log(stress-par[4]) + par[1]
+  
+  
+  # 計算分位數
+  quantile=qnorm(p, mean = 0, sd = 1)
+  return(quantile*par[3]+location)
+}
+Fatigue.life.quantile.weibull<-function(par,p,stress){
+  location <- par[2]*log(stress-par[4]) + par[1]
+  mu <- 0      #標準化SEV 的location
+  sigma <- 1   # scale
+  
+  # 計算分位數
+  quantile <-log(-log(1-p))
+  return(quantile*par[3]+location)
+}
+```
+
+            
+
+```{r}
+## 繪製圖型
+# 創建分位數線的數據
+stress_range <- seq(min(copper_data$sigma), max(copper_data$sigma), length.out = 100)
+
+# 0.5 分位數線的數據
+line_data_50.lognormal.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.lognormal(par.lognormal, 0.5, x)))
+)
+
+# 0.1 分位數線的數據
+line_data_10.lognormal.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.lognormal(par.lognormal, 0.1, x)))
+)
+line_data_1.lognormal.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.lognormal(par.lognormal, 0.01, x)))
+)
+# 0.9 分位數線的數據
+line_data_90.lognormal.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.lognormal(par.lognormal, 0.9, x)))
+)
+
+
+
+# 0.5 分位數線的數據
+line_data_50.weibull.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.weibull(par.weibull, 0.5, x)))
+)
+
+# 0.1 分位數線的數據
+line_data_10.weibull.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.weibull(par.weibull, 0.1, x)))
+)
+line_data_1.weibull.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.weibull(par.weibull, 0.01, x)))
+)
+
+# 0.9 分位數線的數據
+line_data_90.weibull.model1 <- data.frame(
+  sigma = stress_range,
+  cycles = sapply(stress_range, function(x) exp(Fatigue.life.quantile.weibull(par.weibull, 0.9, x)))
+)
+
+
+#繪圖
+ggplot(copper_data, aes(x = cycles, y = stress)) + # [修正1] 這裡直接用原始變數，不要加 log()
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(
+    values = c("0" = 2, "1" = 16),
+    labels = c("0" = "Runout", "1" = "Failure"),
+    name = "Status"
+  ) +
+  
+  scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+  
+  # Y 軸：讓 ggplot 負責轉 log
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  
+  # [修正2] 下面的 geom_line 全部都要改回原始變數 x = cycles, y = sigma
+  # lognormal 分位數線 (實線)
+  geom_line(data = line_data_50.lognormal.model1, 
+            aes(x = cycles, y = sigma, color = "50%", linetype = "Lognormal"), # 去掉 log()
+            linewidth = 1) +
+  geom_line(data = line_data_10.lognormal.model1, 
+            aes(x = cycles, y = sigma, color = "10%", linetype = "Lognormal"), # 去掉 log()
+            linewidth = 1) +
+  geom_line(data = line_data_90.lognormal.model1, 
+            aes(x = cycles, y = sigma, color = "90%", linetype = "Lognormal"), # 去掉 log()
+            linewidth = 1) +
+  
+  # weibull 分位數線 (虛線)
+  geom_line(data = line_data_50.weibull.model1, 
+            aes(x = cycles, y = sigma, color = "50%", linetype = "Weibull"),   # 去掉 log()
+            linewidth = 1) +
+  geom_line(data = line_data_10.weibull.model1, 
+            aes(x = cycles, y = sigma, color = "10%", linetype = "Weibull"),   # 去掉 log()
+            linewidth = 1) +
+  geom_line(data = line_data_90.weibull.model1, 
+            aes(x = cycles, y = sigma, color = "90%", linetype = "Weibull"),   # 去掉 log()
+            linewidth = 1) +
+
+  scale_color_manual(
+    values = c("10%" = "green", "50%" = "red", "90%" = "purple", "1%"="gray")
+  ) +
+  scale_linetype_manual(
+    values = c("Lognormal" = "solid", "Weibull" = "dashed")
+  ) +
+  
+  labs(
+    title = " S-N diagram of Model 1 with fatigue limit for annealed electrolytic copper wire ",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+theme_minimal() +
+theme(
+   text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+   # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+   plot.title = element_text(
+     size = 12,        # 設定標題字體大小 (例如 20)
+     face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+     hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+   ),
+   
+   legend.position = "right"
+ )
+```
+
+
+## model 1 probability plot 
+
+* log normal 
+```{r}
+library(ggplot2)
+# 建立一個函數來篩選特定應力水平的數據
+filter_by_stress <- function(stress, copper_data) {
+  idx <- copper_data$sigma == stress
+  list(
+    life = copper_data$cycles[idx],
+    cen = copper_data$censoring[idx],
+    wts = copper_data$censoring[idx],
+    x = log(copper_data$sigma[idx])
+  )
+}
+
+# 建立繪圖函數
+plot_lognormal_probability <- function(copper_data, stress.list, results) {
+  # 儲存所有數據點
+  plot_data <- data.frame()
+  theoretical_lines <- data.frame()
+  
+  for(i in seq_along(stress.list)) {
+    stress <- stress.list[i]
+    filtered_data <- filter_by_stress(stress, copper_data)
+    
+    # 計算經驗累積機率（使用median rank）
+    n <- length(filtered_data$life)
+    ranks <- rank(filtered_data$life)
+    prob <- (ranks - 0.3) / (n + 0.4)
+    
+    mu.beta.0 = par.hat.lognormal.model1$par[1]
+    mu.beta.1 = par.hat.lognormal.model1$par[2]
+    sigma= par.hat.lognormal.model1$par[3]
+    gamma=par.hat.lognormal.model1$par[4]
+    
+    sorted_life <- sort(filtered_data$life)  # 先排序
+    prob <- (1:n - 0.3) / (n + 0.4)         # 順序機率
+    plot_data <- rbind(plot_data, data.frame(
+    cycles = sorted_life,  # 已排序
+    prob = prob,           # 對應機率
+    stress = as.factor(stress)
+    ))
+    
+    # 生成理論線
+    mu <- mu.beta.0 + mu.beta.1 * log(stress - gamma)
+    
+    theoretical_x <- seq(min(filtered_data$life)-0.05, max(filtered_data$life)+0.5, length.out = 100)
+    
+    theoretical_prob <- plnorm(theoretical_x, meanlog = mu, sdlog = sigma)
+    
+    theoretical_lines <- rbind(theoretical_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob,
+      stress = as.factor(stress)
+    ))
+  }
+  
+  # 繪製圖形
+   ggplot() +
+    geom_point(data = plot_data, aes(x = cycles, y = prob, color = stress),size=1.5) +
+    geom_line(data = theoretical_lines, aes(x = cycles, y = prob, color = stress),linewidth = 1) +
+    scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+    scale_y_continuous(trans = "probit",
+                      breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                               0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+                      labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                               "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")) +
+    xlab("thousands of cycles") +
+    ylab("Fraction failing") +
+    theme_bw() +
+    theme(legend.position = "none")+
+    ggtitle("Lognormal Probability Plot")
+}
+# 使用函數
+stress.list <- unique(copper_data$sigma)
+
+p_new1_log <- plot_lognormal_probability(copper_data, stress.list, results)
+p_new1_log
+```
+
+
+
+* weibull 
+
+```{r}
+library(scales)
+
+# 定義韋伯轉換函數
+weibull_trans <- function() {
+  trans_new(
+    "weibull",
+    transform = function(p) log(-log(1-p)),  # 韋伯轉換
+    inverse = function(x) 1 - exp(-exp(x)),  # 反轉換
+    domain = c(0, 1)
+  )
+}
+
+# 修改繪圖函數
+plot_weibull_probability <- function(copper_data, stress.list, results) {
+  # 儲存所有數據點
+  plot_data <- data.frame()
+  theoretical_lines <- data.frame()
+  
+  for(i in seq_along(stress.list)) {
+    stress <- stress.list[i]
+    filtered_data <- filter_by_stress(stress, copper_data)
+    
+    # 計算經驗累積機率
+    n <- length(filtered_data$life)
+    ranks <- rank(filtered_data$life)
+    prob <- (ranks - 0.3) / (n + 0.4)
+    
+    sorted_life <- sort(filtered_data$life)  # 先排序
+    prob <- (1:n - 0.3) / (n + 0.4)         # 順序機率
+    plot_data <- rbind(plot_data, data.frame(
+    cycles = sorted_life,  # 已排序
+    prob = prob,           # 對應機率
+    stress = as.factor(stress)
+    ))
+    
+    # 生成理論線
+    
+    mu.beta.0 = par.hat.weibull.model1$par[1]
+    mu.beta.1 = par.hat.weibull.model1$par[2]
+    sigma= par.hat.weibull.model1$par[3]
+    gamma=par.hat.weibull.model1$par[4]
+    
+    mu<-mu.beta.0 + mu.beta.1 * log(stress - gamma)
+    # 生成理論線的 x 值
+    theoretical_x <- seq(min(filtered_data$life), 
+                        max(filtered_data$life), 
+                        length.out = 100)
+    
+    # 計算理論機率
+    theoretical_prob <- 1 - exp(-exp((log(theoretical_x) - mu)/sigma))
+    
+    theoretical_lines <- rbind(theoretical_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob,
+      stress = as.factor(stress)
+    ))
+  }
+  
+  # 繪製圖形
+  ggplot() +
+    geom_point(data = plot_data, aes(x = cycles, y = prob, color = stress),size=1.5) +
+    geom_line(data = theoretical_lines, aes(x = cycles, y = prob, color = stress),linewidth = 1) +
+    scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+    scale_y_continuous(
+      trans = weibull_trans(),  # 使用自定義的韋伯轉換
+      breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+      labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")) +
+    xlab("thousands of cycles") +
+    ylab("Fraction failing") +
+    theme_bw() +
+    ggtitle("Weibull Probability Plot")
+}
+p_new1_wei <- plot_weibull_probability(copper_data, stress.list, results)
+p_new1_wei
+```
+```{r}
+
+library(scales)
+
+# 合併兩個模型的繪圖函數（可調整粗細版本）
+plot_combined_probability <- function(copper_data, stress.list, 
+                                     par.hat.lognormal, par.hat.weibull,
+                                     y_trans = "probit",
+                                     point_size = 1.5,      # 點的大小
+                                     line_width = 1.0) {    # 線的粗細
+  
+  plot_data <- data.frame()
+  lognormal_lines <- data.frame()
+  weibull_lines <- data.frame()
+  
+  for(i in seq_along(stress.list)) {
+    stress <- stress.list[i]
+    filtered_data <- filter_by_stress(stress, copper_data)
+    
+    # 計算經驗累積機率
+    n <- length(filtered_data$life)
+    sorted_life <- sort(filtered_data$life)
+    prob <- (1:n - 0.3) / (n + 0.4)
+    
+    plot_data <- rbind(plot_data, data.frame(
+      cycles = sorted_life,
+      prob = prob,
+      stress = as.factor(stress)
+    ))
+    
+    # === Lognormal 理論線 ===
+    mu.beta.0.ln <- par.hat.lognormal$par[1]
+    mu.beta.1.ln <- par.hat.lognormal$par[2]
+    sigma.ln <- par.hat.lognormal$par[3]
+    gamma.ln <- par.hat.lognormal$par[4]
+    
+    mu.ln <- mu.beta.0.ln + mu.beta.1.ln * log(stress - gamma.ln)
+    
+    theoretical_x <- seq(min(filtered_data$life) * 0.8, 
+                        max(filtered_data$life) * 1.2, 
+                        length.out = 200)
+    
+    theoretical_prob.ln <- plnorm(theoretical_x, meanlog = mu.ln, sdlog = sigma.ln)
+    
+    lognormal_lines <- rbind(lognormal_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob.ln,
+      stress = as.factor(stress)
+    ))
+    
+    # === Weibull 理論線 ===
+    mu.beta.0.wb <- par.hat.weibull$par[1]
+    mu.beta.1.wb <- par.hat.weibull$par[2]
+    sigma.wb <- par.hat.weibull$par[3]
+    gamma.wb <- par.hat.weibull$par[4]
+    
+    mu.wb <- mu.beta.0.wb + mu.beta.1.wb * log(stress - gamma.wb)
+    
+    theoretical_prob.wb <- 1 - exp(-exp((log(theoretical_x) - mu.wb) / sigma.wb))
+    
+    weibull_lines <- rbind(weibull_lines, data.frame(
+      cycles = theoretical_x,
+      prob = theoretical_prob.wb,
+      stress = as.factor(stress)
+    ))
+  }
+  
+  # 繪製圖形
+  p <- ggplot() +
+    # 實際數據點 - 使用 point_size 參數
+    geom_point(data = plot_data, 
+               aes(x = cycles, y = prob, color = stress),
+               size = point_size) +
+    # Lognormal 實線 - 使用 line_width 參數
+    geom_line(data = lognormal_lines, 
+              aes(x = cycles, y = prob, color = stress),
+              linewidth = line_width,
+              linetype = "solid") +
+    # Weibull 虛線 - 使用 line_width 參數
+    geom_line(data = weibull_lines, 
+              aes(x = cycles, y = prob, color = stress),
+              linewidth = line_width,
+              linetype = "dashed") +
+    scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+    xlab("thousands of cycles") +
+    ylab("probability") +
+    theme_bw() +
+
+  theme(
+      text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+      # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+      plot.title = element_text(
+        size = 12,        # 設定標題字體大小 (例如 20)
+        face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+        hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 9),
+      legend.position = "right"
+      )
+  # 根據選擇的座標系統添加 y 軸轉換
+  if(y_trans == "probit") {
+    p <- p + 
+      scale_y_continuous(
+        trans = "probit",
+        breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                   0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+        labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                   "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")
+      ) +
+      ggtitle("Probability Plot (Probit Scale) of Model 1 for annealed electrolytic copper wire",
+              subtitle = "Solid: Lognormal | Dashed: Weibull")
+  } else {
+    p <- p + 
+      scale_y_continuous(
+        trans = weibull_trans(),
+        breaks = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 
+                   0.6, 0.7, 0.8, 0.9, 0.95, 0.99),
+        labels = c("0.01", "0.05", "0.1", "0.2", "0.3", "0.4", "0.5",
+                   "0.6", "0.7", "0.8", "0.9", "0.95", "0.99")
+      ) +
+      ggtitle("Probability Plot (Weibull Scale) of Model 1 for annealed electrolytic copper wire",
+              subtitle = "Solid: Lognormal | Dashed: Weibull")
+    
+  }
+  
+  return(p)
+}
+
+# === 使用範例：不同粗細組合 ===
+
+# 1. 預設大小
+p1 <- plot_combined_probability(
+  copper_data, stress.list, 
+  par.hat.lognormal.model1, par.hat.weibull.model1,
+  y_trans = "weibull",
+  point_size = 1.5,    # 預設
+  line_width = 1.0     # 預設
+)
+
+print(p1)
+```
+
+# LRT test 
+
+```{r}
+# 假設你有兩個模型的 -2 log likelihood 值
+neg2loglik_model1.nofatigue <- par.hat.weibull.model1.nofatigue.limit$value  # Model 1 的 -2 log likelihood
+neg2loglik_model1 <- par.hat.weibull.model2$value  # Model 2 的 -2 log likelihood
+
+```
+
+```{r}
+perform_LRT <- function(neg2loglik1, neg2loglik2, df) {
+  # 計算 LRT 統計量
+  LRT_stat <- neg2loglik1 - neg2loglik2
+  
+  # 計算 p 值
+  p_val <- pchisq(LRT_stat, df = df, lower.tail = FALSE)
+  
+  # 結果
+  result <- list(
+    LRT_statistic = LRT_stat,
+    df = df,
+    p_value = p_val,
+    significant = p_val < 0.05
+  )
+  
+  # 印出結果
+  cat("=== 似然比檢驗結果 ===\n")
+  cat("LRT 統計量:", round(LRT_stat, 4), "\n")
+  cat("自由度:", df, "\n")
+  cat("p 值:", format(p_val, scientific = TRUE), "\n")
+  cat("顯著性 (α = 0.05):", ifelse(p_val < 0.05, "顯著", "不顯著"), "\n")
+  
+  return(result)
+}
+
+print(c(neg2loglik_model1.nofatigue * 2, neg2loglik_model1 * 2))
+result <- perform_LRT(neg2loglik_model1.nofatigue*2,neg2loglik_model1*2, df = 1)
+```
+
+
+
+## model 2 without fatigue limit
+
+```{r}
+# 計算應力範圍
+min_stress <- min(Stress.Amplitude)
+max_stress <- max(Stress.Amplitude)
+
+# 確保 Weibull 函數定義正確
+neg.log.likelihood.AR.weibull.linear.nolimit <- function(par, data.t, data.censored, wts, Stress.Amplitude){
+  min_stress <- min(Stress.Amplitude)
+
+  stress_diff <- Stress.Amplitude 
+  if(any(stress_diff <= 0)) {
+    return(1e10)
+  }
+  
+  result <- tryCatch({
+    mu <- par[2] * log(stress_diff) + par[1]
+    sigma <- exp(par[4] * log(Stress.Amplitude) + par[3])
+    
+ 
+    
+    z <- (log(data.t) - mu) / sigma
+    z <- pmax(pmin(z, 700), -700)  # 限制範圍避免溢出
+    
+    log_density <- -log(sigma) - log(data.t) + z - exp(z)
+    log_survival <- -exp(z)
+ 
+    
+    lj <- wts * data.censored * log_density + wts * (1 - data.censored) * log_survival
+    nll <- -sum(lj)
+    
+  
+    
+    return(nll)
+    
+  }, error = function(e) {
+    return(1e10)
+  })
+  
+  return(result)
+}
+
+# 定義 Lognormal 函數
+neg.log.likelihood.AR.lnor.linear.nolimit <- function(par, data.t, data.censored, wts, Stress.Amplitude){
+  min_stress <- min(Stress.Amplitude)
+
+  
+  stress_diff <- Stress.Amplitude 
+  if(any(stress_diff <= 0)) {
+    return(1e10)
+  }
+  
+  result <- tryCatch({
+    mu <- par[2] * log(stress_diff) + par[1]
+    sigma <- exp(par[4] * log(Stress.Amplitude) + par[3])
+    
+    if(any(sigma <= 0) || any(!is.finite(sigma))) {
+      return(1e10)
+    }
+    
+    log_dens <- dlnorm(data.t, mu, sigma, log = TRUE)
+    
+    p_vals <- plnorm(data.t, mu, sigma)
+    p_vals <- pmax(pmin(p_vals, 1 - 1e-15), 1e-15)
+    log_surv <- log(1 - p_vals)
+    
+    
+    
+    lj <- wts * data.censored * log_dens + wts * (1 - data.censored) * log_surv
+    nll <- -sum(lj)
+   
+    
+    return(nll)
+    
+  }, error = function(e) {
+    return(1e10)
+  })
+  
+  return(result)
+}
+
+```
+
+
+
+```{r}
+# 設置合理的初始值 (5個參數)
+#initial <- c( 26 , -4.5   ,5.9, -1, min_stress-1)
+initial <- c( 16.788, -1.529, 4.427 ,-1.129)
+
+# 設置參數界限
+lower_bounds <- c(-Inf, -Inf, -Inf, -Inf)
+upper_bounds <- c(Inf, Inf, Inf, Inf)  # par[5] 必須小於最小應力值
+
+cat("應力範圍:", min_stress, "到", max_stress, "\n")
+cat("x (log應力) 範圍:", range(x), "\n")
+cat("約束條件: par[5] <", min_stress - 0.001, "\n\n")
+# 最佳化 Lognormal 模型
+par.hat.lognormal.model2 <- optim(initial, neg.log.likelihood.AR.lnor.linear.nolimit, 
+                          data.t = life, data.censored = cen, wts = wts, 
+                          Stress.Amplitude = Stress.Amplitude,
+                          method = "L-BFGS-B",
+                          lower = lower_bounds,
+                          upper = upper_bounds,
+                          hessian = TRUE,
+                          control = list(trace = 1))
+
+par.lognormal <- par.hat.lognormal.model2$par
+par.lognormal
+
+# 最佳化 Weibull 模型
+par.hat.weibull.model2 <- optim(initial, neg.log.likelihood.AR.weibull.linear.nolimit, 
+                        data.t = life, data.censored = cen, wts = wts, 
+                        Stress.Amplitude = Stress.Amplitude,
+                        method = "L-BFGS-B",
+                        lower = lower_bounds,
+                        upper = upper_bounds,
+                        hessian = TRUE,
+                        control = list(trace = 1))  # 顯示最佳化過程
+
+par.weibull <- par.hat.weibull.model2$par
+par.weibull
+```
+
+
+
+
+
+```{r}
+df <- data.frame(
+  Distribution = c("Lognormal", "Weibull"),
+  AIC = c(2 * length(par.hat.weibull.model2$par) + 2 * par.hat.lognormal.model2$value, 
+          2 * length(par.hat.weibull.model2$par) + 2 * par.hat.weibull.model2$value),
+  mu.beta.0 = c(par.hat.lognormal.model2$par[1], par.hat.weibull.model2$par[1]),
+  mu.beta.1 = c(par.hat.lognormal.model2$par[2], par.hat.weibull.model2$par[2]),
+  sigma.gamma.0= c(par.hat.lognormal.model2$par[3], par.hat.weibull.model2$par[3]),
+  sigma.gamma.1= c(par.hat.lognormal.model2$par[4], par.hat.weibull.model2$par[4])
+  )
+
+print(df)
+```
+
+## model 3 without fatigue limit
+
+## Inverse - Gamma distribution 
+# Lognormal
+```{r}
+neg.log.likelihood.copper.randomeffect.model3.censored <- function(par, copper_data) {
+  
+  # 1. 參數解析
+  beta0 <- par[1]
+  beta1 <- par[2]
+  delta <- exp(par[3])  # IG 形狀
+  kappa <- exp(par[4])  # IG 尺度
+
+  # 基本檢查
+  min_stress <- min(copper_data$stress)
+
+  stress_levels <- unique(copper_data$stress)
+  total_log_likelihood <- 0
+  
+  for(stress in stress_levels) {
+    # 提取當前應力水準數據
+    current_data <- copper_data[copper_data$stress == stress, ]
+    mu_j <- beta0 + beta1 * log(stress)
+    
+    # 分離失效與設限樣本
+    fail_times <- current_data$cycles[current_data$censoring == 1]
+    cens_times <- current_data$cycles[current_data$censoring == 0]
+    
+    n_f <- length(fail_times) # 失效數
+    n_c <- length(cens_times) # 設限數
+    
+    # ---------------------------------------------------------
+    # 常數項計算 (只針對失效樣本有 1/y 和 2pi)
+    # ---------------------------------------------------------
+    # Lognormal PDF 的 Jacobian: 1/y
+    log_jacobian <- if(n_f > 0) -sum(log(fail_times)) else 0
+    # 常態分佈 PDF 的 (2pi)^(-1/2) 部分
+    log_2pi_const <- if(n_f > 0) -(n_f/2) * log(2 * pi) else 0
+    # Inverse Gamma 的常數部分
+    log_ig_const <- delta * log(kappa) - lgamma(delta)
+    
+    # ---------------------------------------------------------
+    # 積分函數：這部分必須包含所有與 sigma 相關的項
+    # ---------------------------------------------------------
+    integrand <- function(sigma_sq) {
+      sapply(sigma_sq, function(s2) {
+        if(s2 <= 0) return(0)
+        s <- sqrt(s2)
+        
+        # A. 失效樣本的似然貢獻 (exp(-res^2 / 2s2) / s^n_f)
+        if(n_f > 0) {
+          res_sq_sum <- sum((log(fail_times) - mu_j)^2)
+          log_lik_f <- -(res_sq_sum / (2 * s2)) - n_f * log(s)
+        } else {
+          log_lik_f <- 0
+        }
+        
+        # B. 設限樣本的似然貢獻 (Survival function: 1 - Phi(z))
+        if(n_c > 0) {
+          z_c <- (log(cens_times) - mu_j) / s
+          log_lik_c <- sum(pnorm(z_c, lower.tail = FALSE, log.p = TRUE))
+        } else {
+          log_lik_c <- 0
+        }
+        
+        # C. 隨機效應先驗 (Inverse Gamma 的核心部分)
+        log_prior_core <- -(delta + 1) * log(s2) - (kappa / s2)
+        
+        # 合併並轉回原始尺度
+        val <- exp(log_lik_f + log_lik_c + log_prior_core)
+        return(ifelse(is.finite(val), val, 0))
+      })
+    }
+    
+    # 執行積分
+    integration <- try(integrate(integrand, lower = 1e-9, upper = 100, 
+                                 rel.tol = 1e-8), silent = TRUE)
+    
+    if(inherits(integration, "try-error") || integration$value <= 0) return(1e10)
+    
+    # 該應力水準的總對數似然 = 常數項 + log(積分值)
+    log_likelihood_j <- log_jacobian + log_2pi_const + log_ig_const + log(integration$value)
+    total_log_likelihood <- total_log_likelihood + log_likelihood_j
+  }
+  
+  return(-total_log_likelihood)
+}
+```
+
+```{r}
+neg.log.likelihood.model3.optimized <- function(par, copper_data) {
+  # 1. 參數解析與邊界保護
+  beta0 <- par[1]
+  beta1 <- par[2]
+  delta <- exp(par[3])  # 形狀參數
+  kappa <- exp(par[4])  # 尺度參數 (Inverse Gamma)
+
+  # 2. 預計算全域不變項
+  fail_idx <- copper_data$censoring == 1
+  log_jacobian_total <- -sum(log(copper_data$cycles[fail_idx]))
+  
+  stress_levels <- unique(copper_data$stress)
+  total_log_likelihood <- 0
+  
+  for(stress in stress_levels) {
+    curr <- copper_data[copper_data$stress == stress, ]
+    # 模型 3: 基於 Basquin 方程式的基礎擴展 (不含 fatigue limit) [cite: 54, 113]
+    mu_j <- beta0 + beta1 * log(stress)
+    
+    y_f <- curr$cycles[curr$censoring == 1]
+    y_c <- curr$cycles[curr$censoring == 0]
+    n_f <- length(y_f)
+    n_c <- length(y_c)
+    
+    # 預計算與 s2 無關的項以減少積分負擔
+    res_sq_sum <- if(n_f > 0) sum((log(y_f) - mu_j)^2) else 0
+    log_y_c_diff <- if(n_c > 0) log(y_c) - mu_j else NULL
+
+    # ---------------------------------------------------------
+    # 被積函數優化：引入 Scaling Constant C
+    # ---------------------------------------------------------
+    integrand_log <- function(s2) {
+      s <- sqrt(s2)
+      # 失效樣本對數似然 
+      term_f <- if(n_f > 0) -(res_sq_sum / (2 * s2)) - n_f * log(s) - (n_f/2) * log(2*pi) else 0
+      # 設限樣本對數似然 [cite: 142]
+      term_c <- if(!is.null(log_y_c_diff)) sum(pnorm(log_y_c_diff / s, lower.tail = FALSE, log.p = TRUE)) else 0
+      # 逆伽馬先驗核心 [cite: 488, 492]
+      term_prior <- -(delta + 1) * log(s2) - (kappa / s2)
+      return(term_f + term_c + term_prior)
+    }
+
+    # 尋找 Scaling Constant C: 避免數值消失 (Numerical Vanishing)
+    # 取樣數個 s2 以找到對數尺度下的極大值
+    test_points <- c(0.001, 0.01, 0.1, 0.5, 1, 5)
+    sample_v <- sapply(test_points, integrand_log)
+    C <- max(sample_v[is.finite(sample_v)], -700) 
+
+    integrand_stable <- function(s2) {
+      vapply(s2, function(x) {
+        val <- exp(integrand_log(x) - C)
+        return(if(is.finite(val)) val else 0)
+      }, numeric(1))
+    }
+
+    # 執行數值積分：設定更精確的下限以符合隨機效應分布 [cite: 494]
+    itg <- try(integrate(integrand_stable, lower = 1e-8, upper = 50, rel.tol = 1e-6), silent = TRUE)
+    
+    if(inherits(itg, "try-error") || itg$value <= 0) return(1e12)
+    
+    # 加入 IG 常數項: delta * log(kappa) - lgamma(delta)
+    log_ig_const <- delta * log(kappa) - lgamma(delta)
+    total_log_likelihood <- total_log_likelihood + log_ig_const + C + log(itg$value)
+  }
+  
+  res <- -(total_log_likelihood + log_jacobian_total)
+  return(if(is.finite(res)) res else 1e12)
+}
+```
+
+```{r}
+# 設定初始參數 - 現在包含5個參數
+randomeffect.par <- c(22.2829, -2.555059, 2.565989 ,2.730945 )  # 加入gamma參數
+names(randomeffect.par) <- c("beta0", "beta1", "log_delta", "log_kappa")
+
+# 參數解釋
+cat("初始參數:\n")
+cat("beta0 =", randomeffect.par[1], "\n")
+cat("beta1 =", randomeffect.par[2], "\n") 
+cat("delta =", exp(randomeffect.par[3]), "\n")
+cat("kappa =", exp(randomeffect.par[4]), "\n")
+
+# 檢查資料
+cat("=== 資料診斷 ===\n")
+str(copper_data)
+cat("應力水準:", unique(copper_data$stress), "\n")
+cat("最小應力值:", min(copper_data$stress), "\n")
+cat("生命週期範圍:", range(copper_data$cycles), "\n\n")
+
+
+# 設定參數邊界
+lower_bounds <- c(-Inf, -Inf, log(0.01), log(1e-8))  
+upper_bounds <- c(Inf, Inf, log(1000), log(1e6))
+
+# 進行最佳化
+cat("開始最佳化...\n")
+lognormal.randomeffect <- optim(
+  par = randomeffect.par, 
+  fn = neg.log.likelihood.model3.optimized,
+  copper_data = copper_data,
+  method = "L-BFGS-B",
+  lower = lower_bounds,
+  upper = upper_bounds,
+  hessian = TRUE,
+  control = list(
+    trace = 1,
+    maxit = 2000,
+    factr = 1e7
+  )
+)
+
+# 檢查收斂狀況並顯示結果
+if(lognormal.randomeffect$convergence == 0) {
+  cat("\n最佳化成功收斂！\n")
+  
+  cat("\n=== 最佳化結果 ===\n")
+  cat("最終負對數似然值:", lognormal.randomeffect$value, "\n")
+  cat("最佳參數:\n")
+  cat("beta0 =", lognormal.randomeffect$par[1], "\n")
+  cat("beta1 =", lognormal.randomeffect$par[2], "\n")
+  cat("delta =", exp(lognormal.randomeffect$par[3]), "\n")
+  cat("kappa =", exp(lognormal.randomeffect$par[4]), "\n")
+
+  # AIC 計算 (5個參數)
+  lognormal.randomeffect.aic <- 2 * lognormal.randomeffect$value + 2 * length(lognormal.randomeffect$par)
+  cat("AIC:", lognormal.randomeffect.aic, "\n")
+  
+} else {
+  cat("\n警告：最佳化可能未收斂，代碼:", lognormal.randomeffect$convergence, "\n")
+  cat("參數:", lognormal.randomeffect$par, "\n")
+
+}
+```
+
+```{r}
+# 假設最佳化結果存於 lognormal.randomeffect
+beta0 <- lognormal.randomeffect$par[1]
+beta1 <- lognormal.randomeffect$par[2]
+log_delta <- lognormal.randomeffect$par[3]
+log_kappa <- lognormal.randomeffect$par[4]
+
+delta <- exp(log_delta)
+kappa <- exp(log_kappa)
+
+stress_levels <- unique(copper_data$sigma)
+sigma_results_ln <- data.frame()
+
+for(stress in stress_levels) {
+    # 提取當前應力水準數據
+    current_data <- copper_data[copper_data$sigma == stress, ]
+    life_times <- current_data$cycles
+    log_times <- log(life_times)
+    cens <- current_data$censoring # 1=失效, 0=截尾 [cite: 144-146]
+    n_f <- sum(cens == 1)          # 失效樣本數
+    
+    # 計算 μ_j = β₀ + β₁ * log(x_i - γ) 
+    stress_adj <- stress - gamma
+    if(stress_adj <= 0) next 
+    mu_j <- beta0 + beta1 * log(stress_adj)
+
+    # 核心積分邏輯函數
+    # type="D" 計算分母 (邊際似然 Marginal Likelihood)
+    # type="N" 計算分子 (用於計算 E[sigma^2])
+    calc_integral_ln <- function(type = "D") {
+        integrand <- function(sigma_j_2) {
+            sapply(sigma_j_2, function(s2) {
+                if(s2 <= 0) return(0)
+                sigma_j <- sqrt(s2)
+                
+                # 標準化殘差 z = (log(y) - mu) / sigma [cite: 143]
+                z <- (log_times - mu_j) / sigma_j
+                
+                # --- 對數常態似然 (Lognormal Likelihood with Censoring) ---
+                # 失效樣本 (cens == 1): 使用對數 PDF [cite: 152]
+                #   log_pdf = log(phi(z)) - log(sigma) - log(y)
+                # 截尾樣本 (cens == 0): 使用對數生存函數 [cite: 152]
+                #   log_surv = log(1 - Phi(z))
+                log_lik <- sum(ifelse(cens == 1, 
+                                      dnorm(z, log = TRUE) - log(sigma_j) - log_times, 
+                                      pnorm(z, lower.tail = FALSE, log.p = TRUE)))
+                
+                # --- 逆伽馬先驗 (Inverse Gamma Prior) ---
+                log_prior <- delta * log(kappa) - lgamma(delta) - 
+                             (delta + 1) * log(s2) - (kappa / s2)
+                
+                # 結合似然與先驗
+                log_target <- log_lik + log_prior
+                
+                # 如果是計算期望值的分子，額外乘上 sigma_j^2
+                if(type == "N") log_target <- log_target + log(s2)
+                
+                # 數值穩定性處理
+                if(is.na(log_target) || log_target < -700) return(0)
+                if(log_target > 700) log_target <- 700 
+                return(exp(log_target))
+            })
+        }
+        
+        # 進行數值積分
+        integrate(integrand, lower = 0, upper = Inf, 
+                  rel.tol = 1e-10, abs.tol = 1e-12)$value
+    }
+
+    # 計算期望值 E[sigma^2] = 分子 / 分母
+    denominator <- calc_integral_ln(type = "D")
+    numerator   <- calc_integral_ln(type = "N")
+    
+    sigma_j_squared <- numerator / denominator
+    
+    # 儲存結果
+    sigma_results_ln <- rbind(sigma_results_ln, 
+                             data.frame(stress_level = stress,
+                                        sigma_j_squared = sigma_j_squared,
+                                        sigma_j = sqrt(sigma_j_squared),
+                                        num_failures = n_f,
+                                        num_runouts = sum(cens == 0)))
+}
+
+print(sigma_results_ln)
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# 1. 整理參數：使用從對數常態期望值計算得出的 sigma_j_vector
+# 參數順序：[beta0, beta1, sigma_j1, ..., sigma_jk, gamma]
+n_sigma_ln <- length(sigma_results_ln$sigma_j)
+randomeffect.par.lognormal <- c(beta0, beta1, sigma_results_ln$sigma_j)
+
+# 2. 優化對數常態分位數計算函數
+get_lognormal_quantile <- function(p, par, stress, stress_index) {
+  # 參數解析
+  b0 <- par[1]
+  b1 <- par[2]
+  s_j <- par[2 + stress_index]     # 對應應力水準的 sigma_j 點估計值
+  
+  # 位置參數 mu_j = beta0 + beta1 * log(stress - gamma) [cite: 113]
+  location <- b0 + b1 * log(stress)
+  
+  # 對數常態分位數公式：log(Life)_p = mu + sigma * Phi^-1(p) 
+  # qnorm(p) 是標準常態分佈的分位數函數
+  log_cycle <- location + s_j * qnorm(p)
+  
+  return(exp(log_cycle))
+}
+
+# 3. 批量生成分位數線數據
+# 這裡定義 stress.list 為您想繪圖的應力範圍
+probs <- c(0.1, 0.5, 0.9)
+line_data_lognormal <- expand.grid(sigma = stress.list, p = probs) %>%
+  group_by(p) %>%
+  mutate(index = row_number()) %>%
+  rowwise() %>%
+  mutate(cycle = get_lognormal_quantile(p, randomeffect.par.lognormal, sigma, index)) %>%
+  ungroup() %>%
+  mutate(p_label = scales::percent(p))
+
+
+
+
+library(ggplot2)
+library(scales)
+
+ggplot(copper_data, aes(x = cycles, y = stress)) +
+  # 1. 散佈點層
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(
+    values = c("0" = 2, "1" = 16),
+    labels = c("0" = "Runout", "1" = "Failure"),
+    name = "Status"
+  ) +
+  
+  # 2. 擬合線層 (顏色映射到 p_label)
+  geom_path(data = line_data_lognormal, 
+            aes(x = cycle, y = sigma, color = p_label, group = p_label), 
+            linewidth = 1) +
+  
+  # 3. 設定自定義顏色
+  scale_color_manual(
+    values = c(
+      "10%"  = "green", 
+      "50%"  = "red", 
+      "90%"  = "purple"
+    )
+  ) +
+  
+  # 4. 座標軸設定
+  scale_x_continuous(
+    trans = "log", 
+    breaks = scales::trans_breaks("log10", function(x) 10^x),
+    labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x))
+  ) +
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  
+  # 5. 標籤與主題
+  labs(
+    title = "S-N diagram for annealed electrolytic copper wire",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+```{r}
+library(ggplot2)
+
+log_delta <- lognormal.randomeffect$par[3]
+log_kappa <- lognormal.randomeffect$par[4]
+
+delta <- exp(log_delta)
+kappa <- exp(log_kappa)
+# 2. 定義逆伽馬 PDF 函數
+
+
+inv_gamma_pdf <- function(x, alpha, beta) {
+  # 使用對數尺度計算以確保數值穩定
+  log_pdf <- alpha * log(beta) - lgamma(alpha) - (alpha + 1) * log(x) - (beta / x)
+  return(exp(log_pdf))
+}
+
+# 3. 設定繪圖範圍 (x 軸代表 sigma^2)
+# 逆伽馬的眾數 (Mode) 在 beta / (alpha + 1)
+mode_val <- kappa / (delta + 1)
+x_range <- seq(1e-5, mode_val * 8, length.out = 1000) # 繪製到眾數的 5 倍距離
+
+# 4. 建立資料表
+df_pdf_lognormal <- data.frame(
+  sigma_sq = x_range,
+  density = inv_gamma_pdf(x_range, delta, kappa)
+)
+
+# 5. 繪圖
+ggplot(df_pdf_lognormal, aes(x = sigma_sq, y = density)) +
+  geom_area(fill = "skyblue", alpha = 0.4) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  # 標示眾數 (最有可能出現的變異數)
+  geom_vline(xintercept = mode_val, linetype = "dashed", color = "red") +
+  annotate("text", x = mode_val, y = max(df_pdf_lognormal$density), 
+           label = paste("Mode =", round(mode_val, 4)), 
+           vjust = -0.5, color = "red") +
+  labs(
+    title = "Inverse Gamma PDF of Random Effect (Variance Sigma^2)",
+    subtitle = paste0("Parameters: delta (alpha) = ", round(delta, 3), 
+                      ", kappa (beta) = ", round(kappa, 3)),
+    x = expression(sigma^2),
+    y = "Probability Density"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+# Weibull 
+
+```{r}
+neg.wei.likelihood.copper.randomeffect.optimized <- function(par, copper_data) {
+  # 1. 參數解析
+  # par = c(beta0, beta1, log_delta, log_kappa, gamma)
+  beta0 <- par[1]
+  beta1 <- par[2]
+  delta <- exp(par[3])  # 形狀參數 alpha
+  kappa <- exp(par[4])  # 尺度參數 beta (IG)
+
+  # 2. 邊界檢查 (針對含疲勞極限的模型)
+  min_stress_fail <- min(copper_data$stress[copper_data$censoring == 1])
+
+  stress_levels <- unique(copper_data$stress)
+  total_log_likelihood <- 0
+  
+  # 全域 Jacobian (對數轉換項 -sum(log(y)))
+  fail_idx_all <- copper_data$censoring == 1
+  log_jacobian_total <- -sum(log(copper_data$cycles[fail_idx_all]))
+
+  for(stress in stress_levels) {
+    curr <- copper_data[copper_data$stress == stress, ]
+    mu_j <- beta0 + beta1 * log(stress )
+    
+    y_log <- log(curr$cycles)
+    cens <- curr$censoring
+    n_f <- sum(cens == 1)
+    
+    # --- 被積函數優化 ---
+    integrand_log <- function(s2) {
+      s <- sqrt(s2)
+      z <- (y_log - mu_j) / s
+      
+      # Weibull 在 log 尺度下為極小值分佈 (Extreme Value Dist)
+      # 失效 (cens==1): log(f) = -log(s) + z - exp(z)
+      # 設限 (cens==0): log(S) = -exp(z)
+      log_lik_obs <- ifelse(cens == 1, -log(s) + z - exp(z), -exp(z))
+      
+      # 逆伽馬先驗核心 (不含常數項，常數項統一在積分外加回)
+      log_prior_core <- -(delta + 1) * log(s2) - (kappa / s2)
+      
+      return(sum(log_lik_obs) + log_prior_core)
+    }
+
+    # 3. 數值穩定性：尋找 Scaling Constant C
+    # 這是防止 Code 52 的關鍵，將積分值維持在 exp(0) 附近
+    test_points <- c(0.001, 0.01, 0.1, 0.5, 1, 5)
+    sample_v <- sapply(test_points, integrand_log)
+    C <- max(sample_v[is.finite(sample_v)], -700)
+
+    integrand_stable <- function(s2) {
+      vapply(s2, function(x) {
+        val <- exp(integrand_log(x) - C)
+        return(if(is.finite(val)) val else 0)
+      }, numeric(1))
+    }
+
+    # 4. 執行積分
+    itg <- try(integrate(integrand_stable, lower = 1e-8, upper = 100, rel.tol = 1e-6), silent = TRUE)
+    
+    if(inherits(itg, "try-error") || itg$value <= 0) return(1e12)
+    
+    # 加入 IG 常數項: delta * log(kappa) - lgamma(delta)
+    log_ig_const <- delta * log(kappa) - lgamma(delta)
+    total_log_likelihood <- total_log_likelihood + log_ig_const + C + log(itg$value)
+  }
+  
+  res <- -(total_log_likelihood + log_jacobian_total)
+  return(if(is.finite(res)) res else 1e12)
+}
+```
+
+
+
+
+
+```{r}
+# 設定初始參數 - 現在包含5個參數
+randomeffect.par <- c(30,-4, 4, 4)  # 加入gamma參數
+names(randomeffect.par) <- c("beta0", "beta1", "log_delta", "log_kappa")
+
+# 參數解釋
+cat("初始參數:\n")
+cat("beta0 =", randomeffect.par[1], "\n")
+cat("beta1 =", randomeffect.par[2], "\n") 
+cat("delta =", exp(randomeffect.par[3]), "\n")
+cat("kappa =", exp(randomeffect.par[4]), "\n")
+
+# 檢查資料
+cat("=== 資料診斷 ===\n")
+str(copper_data)
+cat("應力水準:", unique(copper_data$stress), "\n")
+cat("最小應力值:", min(copper_data$stress), "\n")
+cat("生命週期範圍:", range(copper_data$cycles), "\n\n")
+
+
+
+
+lower_bounds <- c(-Inf, -Inf, log(0.01), log(1e-8))  
+upper_bounds <- c( Inf, Inf, log(1000), log(1e6))
+# 進行最佳化
+cat("開始最佳化...\n")
+weibull.randomeffect <- optim(
+  par = randomeffect.par, 
+  fn = neg.wei.likelihood.copper.randomeffect.optimized,
+  copper_data = copper_data,
+  method = "L-BFGS-B",
+  lower = lower_bounds,
+  upper = upper_bounds,
+  hessian = TRUE,
+  control = list(
+    trace = 1,
+    maxit = 2000,
+    factr = 1e7
+  )
+)
+
+# 檢查收斂狀況並顯示結果
+if(weibull.randomeffect$convergence == 0) {
+  cat("\n最佳化成功收斂！\n")
+  
+  cat("\n=== 最佳化結果 ===\n")
+  cat("最終負對數似然值:", weibull.randomeffect$value, "\n")
+  cat("最佳參數:\n")
+  cat("beta0 =", weibull.randomeffect$par[1], "\n")
+  cat("beta1 =", weibull.randomeffect$par[2], "\n")
+  cat("delta =", exp(weibull.randomeffect$par[3]), "\n")
+  cat("kappa =", exp(weibull.randomeffect$par[4]), "\n")
+
+  # AIC 計算 (5個參數)
+  weibull.randomeffect.aic <- 2 * weibull.randomeffect$value + 2 * 4
+  cat("AIC:", weibull.randomeffect.aic, "\n")
+  
+} else {
+  cat("\n警告：最佳化可能未收斂，代碼:", weibull.randomeffect$convergence, "\n")
+    cat("參數:", weibull.randomeffect$par, "\n")
+
+}
+```
+
+```{r}
+beta0 = weibull.randomeffect$par[1]
+beta1 = weibull.randomeffect$par[2]
+
+# Gamma 分布參數
+delta <- exp(weibull.randomeffect$par[3]) 
+kappa <- exp(weibull.randomeffect$par[4])
+stress_levels <- unique(copper_data$sigma)
+
+sigma_results <- data.frame()
+
+for(stress in stress_levels) {
+    # 提取數據
+    current_data <- copper_data[copper_data$sigma == stress, ]
+    life_times <- current_data$cycles
+    cens <- current_data$censoring      # 1=失效, 0=截尾
+    n_f <- sum(cens == 1)               # 失效樣本數
+    log_times <- log(life_times)
+    
+    # 計算 μ_j
+    stress_adjusted <- stress
+    if(stress_adjusted <= 0) next
+    mu_j <- beta0 + beta1 * log(stress_adjusted)
+    
+    # 1. 修正 Jacobian：只有失效樣本需要 -sum(log(t))
+    log_product_ti_inv <- -sum(log_times[cens == 1])
+    
+    # 2. 先驗常數項
+    log_kappa_delta <- delta * log(kappa)
+    log_gamma_denominator <- lgamma(delta)
+    
+    ###########################################################################
+    # 定義核心似然計算函數 (包含向量化與 Censoring)
+    ###########################################################################
+    # @param type "D" 為分母 (Posterior normalization), "N" 為分子 (Expectation)
+    get_integrand <- function(type = "D") {
+        return(function(sigma_j_2) {
+            sigma_j_2 <- as.numeric(sigma_j_2)
+            results <- numeric(length(sigma_j_2))
+            
+            for(i in seq_along(sigma_j_2)) {
+                s2 <- sigma_j_2[i]
+                if(s2 <= 0) { results[i] <- 0; next }
+                
+                s <- sqrt(s2)
+                z <- (log_times - mu_j) / s
+                
+                # --- 韋伯似然項 (修正 Censoring 邏輯) ---
+                # 失效: z - exp(z) - log(s)
+                # 設限: -exp(z)
+                # 注意：log(s) 項在下面 power_term 統一處理 (n_f/2)
+                weibull_log_lik_parts <- ifelse(cens == 1, 
+                                               z - exp(z), 
+                                               -exp(z))
+                log_lik_sum <- sum(weibull_log_lik_parts)
+                
+                # --- 冪次項與先驗項 ---
+                # 分母權重: s2^(-n_f/2 - delta - 1) 
+                # 分子權重: s2^(-n_f/2 - delta) (因為多乘了 s2)
+                if (type == "D") {
+                    power_term <- -n_f/2 - delta - 1
+                } else {
+                    power_term <- -n_f/2 - delta
+                }
+                
+                exp_term <- -kappa / s2
+                
+                # 總對數結果
+                log_result <- power_term * log(s2) + log_lik_sum + exp_term
+                
+                # 數值穩定保護
+                if(is.na(log_result) || log_result < -700) {
+                    results[i] <- 0
+                } else if(log_result > 700) {
+                    results[i] <- exp(700) 
+                } else {
+                    results[i] <- exp(log_result)
+                }
+            }
+            return(results)
+        })
+    }
+    
+    ###########################################################################
+    # 執行積分
+    ###########################################################################
+    # 分母积分
+    int_den <- integrate(get_integrand("D"), lower = 1e-12, upper = Inf, 
+                         rel.tol = 1e-10, abs.tol = 1e-12)
+    
+    # 分子积分
+    int_num <- integrate(get_integrand("N"), lower = 1e-12, upper = Inf, 
+                         rel.tol = 1e-10, abs.tol = 1e-12)
+    
+    # 因為常數項在分子分母會抵消，直接用積分值的比值即可
+    # E[sigma^2] = (C * int_num) / (C * int_den) = int_num / int_den
+    sigma_j_squared <- int_num$value / int_den$value
+    
+    # 儲存結果
+    sigma_results <- rbind(sigma_results, 
+                          data.frame(stress_level = stress,
+                                     sigma_j_squared = sigma_j_squared,
+                                     sigma_j = sqrt(sigma_j_squared),
+                                     n_fail = n_f,
+                                     n_runout = sum(cens == 0)))
+}
+
+print(sigma_results)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# 1. 整理參數：自動適應參數長度，避免硬編碼 "12parm"
+# 假設格式為 [beta0, beta1, sigma_j1, ..., sigma_jk, gamma]
+sigma_j_vector <- sigma_results$sigma_j
+n_sigma <- sigma_j_vector
+randomeffect.par.weibull <- c(beta0, beta1, sigma_j_vector)
+
+# 2. 優化分位數計算函數：更具通用性
+get_weibull_quantile <- function(p, par, stress, stress_index) {
+  # 參數解析
+  b0 <- par[1]
+  b1 <- par[2]
+  g  <- par[length(par)] # 最後一個是 gamma
+  s_j <- par[2 + stress_index] # sigma 參數區間
+  
+  # 位置參數 mu_j [cite: 113]
+  location <- b0 + b1 * log(stress )
+  
+  # 韋伯分佈（極值分佈）分位數公式
+  # log(Life)_p = mu + sigma * log(-log(1-p))
+  log_cycle <- location + s_j * log(-log(1 - p))
+  return(exp(log_cycle))
+}
+
+# --- 修正後的步驟 3：生成分位數數據 ---
+probs <- c(0.1, 0.5, 0.9)
+quantile_lines <- expand.grid(sigma = stress.list, p = probs) %>% # 這裡把 stress 改成 sigma
+  group_by(p) %>%
+  mutate(index = row_number()) %>%
+  rowwise() %>%
+  # 這裡把結果存為 cycles (複數)，對應原始資料
+  mutate(cycles = get_weibull_quantile(p, randomeffect.par.weibull, sigma, index)) %>%
+  ungroup() %>%
+  mutate(p_label = factor(scales::percent(p)))
+
+# 重新分割資料表
+line_data_10.weibull.randomeffect <- quantile_lines %>% filter(p == 0.1)
+line_data_50.weibull.randomeffect <- quantile_lines %>% filter(p == 0.5)
+line_data_90.weibull.randomeffect <- quantile_lines %>% filter(p == 0.9)
+
+
+
+
+
+ggplot(copper_data, aes(x = cycles, y = stress)) + # [修正1] 這裡直接用原始變數，不要加 log()
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(
+    values = c("0" = 2, "1" = 16),
+    labels = c("0" = "Runout", "1" = "Failure"),
+    name = "Status"
+  ) +
+  geom_path(data = arrange(line_data_50.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "50%", linetype = "Weibull"), linewidth = 1) +
+  geom_path(data = arrange(line_data_10.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "10%", linetype = "Weibull"), linewidth = 1) +
+  geom_path(data = arrange(line_data_90.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "90%", linetype = "Weibull"), linewidth = 1) +
+  scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+  
+  # Y 軸：讓 ggplot 負責轉 log
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  
+
+
+  scale_color_manual(
+    values = c("10%" = "green", "50%" = "red", "90%" = "purple", "1%"="gray")
+  ) +
+  scale_linetype_manual(
+    values = c("Weibull" = "solid")
+  ) +
+  
+  labs(
+    title = " S-N diagram of Model 1 for annealed electrolytic copper wire ",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+theme_minimal() +
+theme(
+   text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+   # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+   plot.title = element_text(
+     size = 12,        # 設定標題字體大小 (例如 20)
+     face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+     hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+   ),
+   
+   legend.position = "right"
+ )
+```
+
+
+
+```{r}
+library(ggplot2)
+
+log_delta <- weibull.randomeffect$par[3]
+log_kappa <- weibull.randomeffect$par[4]
+
+delta <- exp(log_delta)
+kappa <- exp(log_kappa)
+# 2. 定義逆伽馬 PDF 函數
+
+
+inv_gamma_pdf <- function(x, alpha, beta) {
+  # 使用對數尺度計算以確保數值穩定
+  log_pdf <- alpha * log(beta) - lgamma(alpha) - (alpha + 1) * log(x) - (beta / x)
+  return(exp(log_pdf))
+}
+
+# 3. 設定繪圖範圍 (x 軸代表 sigma^2)
+# 逆伽馬的眾數 (Mode) 在 beta / (alpha + 1)
+mode_val <- kappa / (delta + 1)
+x_range <- seq(1e-5, mode_val * 4, length.out = 1000) # 繪製到眾數的 5 倍距離
+
+# 4. 建立資料表
+df_pdf_weibull <- data.frame(
+  sigma_sq = x_range,
+  density = inv_gamma_pdf(x_range, delta, kappa)
+)
+
+# 5. 繪圖
+ggplot(df_pdf_weibull, aes(x = sigma_sq, y = density)) +
+  geom_area(fill = "skyblue", alpha = 0.4) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  # 標示眾數 (最有可能出現的變異數)
+  geom_vline(xintercept = mode_val, linetype = "dashed", color = "red") +
+  annotate("text", x = mode_val, y = max(df_pdf_weibull$density), 
+           label = paste("Mode =", round(mode_val, 4)), 
+           vjust = -0.5, color = "red") +
+  labs(
+    title = "Inverse Gamma PDF of Random Effect (Variance Sigma^2)",
+    subtitle = paste0("Parameters: delta (alpha) = ", round(delta, 3), 
+                      ", kappa (beta) = ", round(kappa, 3)),
+    x = expression(sigma^2),
+    y = "Probability Density"
+  ) +
+  theme_minimal()
+```
+
+
+
+# 兩分佈
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. 幫資料表加上標籤 (以便區分)
+df_pdf_lognormal <- df_pdf_lognormal %>% mutate(Model = "Lognormal")
+df_pdf_weibull <- df_pdf_weibull %>% mutate(Model = "Weibull")
+
+# 2. 合併資料表
+df_plot <- bind_rows(df_pdf_lognormal, df_pdf_weibull)
+
+# 3. 繪圖
+ggplot(df_plot, aes(x = sigma_sq, y = density, color = Model, fill = Model)) +
+  # 使用 geom_area 繪製半透明填充
+  #geom_area(position = "identity", alpha = 0.2) +
+  # 使用 geom_line 繪製外框線
+  geom_line(linewidth = 1) +
+  
+  # 設定 X 軸標籤與數學符號
+  labs(
+    title = "Comparison of Random Effect Distributions (Inverse Gamma)",
+    subtitle = "Inverse Gamma PDF for Scale Parameter σ²",
+    x = expression(paste("scale parameter ", sigma^2)),
+    y = "density",
+    color = "Distribution",
+    fill = "Distribution"
+  ) +
+  
+  # 自定義顏色 (可自行修改)
+  scale_color_manual(values = c("Lognormal" = "#E41A1C", 
+                               "Weibull" = "#377EB8")) +
+  #scale_fill_manual(values = c("Lognormal Random Effect" = "#E41A1C", 
+  #                             "Weibull Random Effect" = "#377EB8")) +
+  
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    
+    # 主標題設定
+    plot.title = element_text(
+        size = 12,        
+        face = "bold",    
+        hjust = 0.5       # 主標題置中
+      ),
+    
+    # 副標題設定 (新增這部分)
+    plot.subtitle = element_text(
+        size = 10,        # 通常副標題會比主標題小一點
+        hjust = 0.5       # 副標題置中
+      ),
+      
+    legend.position = "right"
+  )
+```
+
+```{r}
+ggplot(copper_data, aes(x = cycles, y = stress)) + # [修正1] 這裡直接用原始變數，不要加 log()
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(
+    values = c("0" = 2, "1" = 16),
+    labels = c("0" = "Runout", "1" = "Failure"),
+    name = "Status"
+  ) +
+  geom_path(data = arrange(line_data_50.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "50%", linetype = "Weibull"), linewidth = 1) +
+  geom_path(data = arrange(line_data_10.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "10%", linetype = "Weibull"), linewidth = 1) +
+  geom_path(data = arrange(line_data_90.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "90%", linetype = "Weibull"), linewidth = 1) +
+    # 2. 擬合線層 (顏色映射到 p_label)
+  geom_path(data = line_data_lognormal, 
+            aes(x = cycle, y = sigma, color = p_label, group = p_label,linetype = "Lognormal"), 
+            linewidth = 1) +
+  
+  scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+  
+  # Y 軸：讓 ggplot 負責轉 log
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  
+
+
+  scale_color_manual(
+    values = c("10%" = "green", "50%" = "red", "90%" = "purple", "1%"="gray")
+  ) +
+  scale_linetype_manual(
+    values = c("Weibull" = "dashed","Lognormal"="solid")
+  ) +
+  
+  labs(
+    title = " S-N Diagram of Model 3 (Inv-Gamma) for Annealed Electrolytic Copper Wire ",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+theme_minimal() +
+theme(
+   text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+   # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+   plot.title = element_text(
+     size = 12,        # 設定標題字體大小 (例如 20)
+     face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+     hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+   ),
+   
+   legend.position = "right"
+ )
+```
+## Gamma distribution 
+
+# Lognormal 
+```{r}
+neg.log.likelihood.copper.gamma.randomeffect.censored <- function(par, copper_data) {
+  
+  # 1. 參數解析
+  beta0 <- par[1]
+  beta1 <- par[2]
+  delta <- exp(par[3])  # Gamma Shape (形狀參數)
+  kappa <- exp(par[4])  # Gamma Rate (速率參數)
+
+  # 基本檢查
+  min_stress <- min(copper_data$stress)
+
+  stress_levels <- unique(copper_data$stress)
+  total_log_likelihood <- 0
+  
+  for(stress in stress_levels) {
+    # 提取當前應力水準數據
+    current_data <- copper_data[copper_data$stress == stress, ]
+    mu_j <- beta0 + beta1 * log(stress)
+    
+    # 分離失效與設限樣本
+    fail_times <- current_data$cycles[current_data$censoring == 1]
+    cens_times <- current_data$cycles[current_data$censoring == 0]
+    
+    n_f <- length(fail_times) 
+    n_c <- length(cens_times) 
+    
+    # ---------------------------------------------------------
+    # 常數項計算
+    # ---------------------------------------------------------
+    log_jacobian <- if(n_f > 0) -sum(log(fail_times)) else 0
+    log_2pi_const <- if(n_f > 0) -(n_f/2) * log(2 * pi) else 0
+    
+    # 這裡修正為 Gamma 分佈的常數項 (其實公式與 IG 相同，但物理意義不同)
+    log_gamma_prior_const <- delta * log(kappa) - lgamma(delta)
+    
+    # ---------------------------------------------------------
+    # 積分函數：將先驗部分改為 Gamma 分佈
+    # ---------------------------------------------------------
+    integrand <- function(sigma_sq) {
+      vapply(sigma_sq, function(s2) {
+        if(s2 <= 0) return(0)
+        s <- sqrt(s2)
+        
+        # A. 失效樣本似然 (Lognormal PDF)
+        if(n_f > 0) {
+          res_sq_sum <- sum((log(fail_times) - mu_j)^2)
+          log_lik_f <- -(res_sq_sum / (2 * s2)) - n_f * log(s)
+        } else {
+          log_lik_f <- 0
+        }
+        
+        # B. 設限樣本似然 (Survival function)
+        if(n_c > 0) {
+          z_c <- (log(cens_times) - mu_j) / s
+          log_lik_c <- sum(pnorm(z_c, lower.tail = FALSE, log.p = TRUE))
+        } else {
+          log_lik_c <- 0
+        }
+        
+        # C. 【修正點】隨機效應先驗 (Gamma Core)
+        # 公式：(delta - 1) * log(s2) - kappa * s2
+        log_prior_core <- (delta - 1) * log(s2) - (kappa * s2)
+        
+        val <- exp(log_lik_f + log_lik_c + log_prior_core)
+        return(ifelse(is.finite(val), val, 0))
+      }, numeric(1))
+    }
+    
+    # 執行積分
+    integration <- try(integrate(integrand, lower = 0, upper = Inf, 
+                                 rel.tol = 1e-8), silent = TRUE)
+    
+    if(inherits(integration, "try-error") || integration$value <= 0) return(1e10)
+    
+    log_likelihood_j <- log_jacobian + log_2pi_const + log_gamma_prior_const + log(integration$value)
+    total_log_likelihood <- total_log_likelihood + log_likelihood_j
+  }
+  
+  return(-total_log_likelihood)
+}
+```
+
+```{r}
+neg.log.likelihood.copper.gamma.randomeffect <- function(par, copper_data) {
+  # 參數解析
+  beta0 <- par[1]
+  beta1 <- par[2]
+  delta <- exp(par[3]) # Gamma Shape
+  kappa <- exp(par[4]) # Gamma Rate
+
+  # 嚴格邊界檢查 
+  min_stress_fail <- min(copper_data$stress[copper_data$censoring == 1])
+
+  fail_idx <- copper_data$censoring == 1
+  log_jacobian_total <- -sum(log(copper_data$cycles[fail_idx]))
+  
+  total_log_likelihood <- 0
+  stress_levels <- unique(copper_data$stress)
+  
+  for (stress in stress_levels) {
+    curr <- copper_data[copper_data$stress == stress, ]
+    # Pascual (1999) 方程式 (1) [cite: 113]
+    mu_j <- beta0 + beta1 * log(stress ) 
+    
+    y_f <- curr$cycles[curr$censoring == 1]
+    y_c <- curr$cycles[curr$censoring == 0]
+    n_f <- length(y_f)
+    n_c <- length(y_c)
+    
+    res_sq_sum <- if (n_f > 0) sum((log(y_f) - mu_j)^2) else 0
+    log_y_c_diff <- if (n_c > 0) log(y_c) - mu_j else NULL
+
+    # 被積函數穩定化 
+    integrand_log <- function(s2) {
+      s <- sqrt(s2)
+      term_f <- if (n_f > 0) -(res_sq_sum / (2 * s2)) - n_f * log(s) - (n_f/2) * log(2 * pi) else 0
+      term_c <- if (!is.null(log_y_c_diff)) sum(pnorm(log_y_c_diff / s, lower.tail = FALSE, log.p = TRUE)) else 0
+      term_prior <- (delta - 1) * log(s2) - (kappa * s2)
+      return(term_f + term_c + term_prior)
+    }
+
+    # 尋找積分縮放常數 C 以防止 Code 52 錯誤
+    # 嘗試多個點以尋找最大值
+    test_s2 <- c(0.001, 0.01, 0.1, 0.5, 1, 10)
+    sample_v <- sapply(test_s2, integrand_log)
+    C <- max(sample_v[is.finite(sample_v)], -700)
+
+    integrand_stable <- function(s2) {
+      vapply(s2, function(x) {
+        val <- exp(integrand_log(x) - C)
+        return(if (is.finite(val)) val else 0)
+      }, numeric(1))
+    }
+
+    itg <- try(integrate(integrand_stable, lower = 1e-7, upper = Inf, rel.tol = 1e-6), silent = TRUE)
+    
+    if (inherits(itg, "try-error") || itg$value <= 0) return(1e12)
+    
+    log_gamma_const <- delta * log(kappa) - lgamma(delta)
+    total_log_likelihood <- total_log_likelihood + log_gamma_const + C + log(itg$value)
+  }
+  
+  final_nll <- -(total_log_likelihood + log_jacobian_total)
+  return(if (is.finite(final_nll)) final_nll else 1e12)
+}
+```
+
+```{r}
+
+# 設定初始參數 - 現在包含5個參數2
+randomeffect.par <- c(37.910,	-5.922,-0.4575208 ,0.4557723 )  # 加入gamma參數
+names(randomeffect.par) <- c("beta0", "beta1", "log_delta", "log_kappa")
+#14.748, -1.392, -0.3104461 ,1.396582,
+# 參數解釋
+cat("初始參數:\n")
+cat("beta0 =", randomeffect.par[1], "\n")
+cat("beta1 =", randomeffect.par[2], "\n") 
+cat("delta =", exp(randomeffect.par[3]), "\n")
+cat("kappa =", exp(randomeffect.par[4]), "\n")
+
+# 檢查資料
+cat("=== 資料診斷 ===\n")
+str(copper_data)
+cat("應力水準:", unique(copper_data$sigma), "\n")
+cat("最小應力值:", min(copper_data$sigma), "\n")
+cat("生命週期範圍:", range(copper_data$cycles), "\n\n")
+
+
+# 設定參數邊界
+lower_bounds <- c(-Inf, -Inf, log(1e-8), log(1e-8))  
+upper_bounds <- c(Inf, Inf, log(1e6), log(1e6))
+
+# 進行最佳化
+cat("開始最佳化...\n")
+lognormal.gamma.randomeffect <- optim(
+  par = randomeffect.par, 
+  fn = neg.log.likelihood.copper.gamma.randomeffect,
+  copper_data = copper_data,
+  method = "L-BFGS-B",
+  lower = lower_bounds,
+  upper = upper_bounds,
+  hessian = TRUE,
+  control = list(
+    trace = 1,
+    maxit = 2000,
+    factr = 1e7
+  )
+)
+
+# 檢查收斂狀況並顯示結果
+if(lognormal.gamma.randomeffect$convergence == 0) {
+  cat("\n最佳化成功收斂！\n")
+  
+  cat("\n=== 最佳化結果 ===\n")
+  cat("最終負對數似然值:", lognormal.gamma.randomeffect$value, "\n")
+  cat("最佳參數:\n")
+  cat("beta0 =", lognormal.gamma.randomeffect$par[1], "\n")
+  cat("beta1 =", lognormal.gamma.randomeffect$par[2], "\n")
+  cat("delta =", exp(lognormal.gamma.randomeffect$par[3]), "\n")
+  cat("kappa =", exp(lognormal.gamma.randomeffect$par[4]), "\n")
+
+  cat("lndelta =", lognormal.gamma.randomeffect$par[3], "\n")
+  cat("lnkappa =", lognormal.gamma.randomeffect$par[4], "\n")
+  # AIC 計算 (5個參數)
+  lognormal.gamma.randomeffect.aic <- 2 * lognormal.gamma.randomeffect$value + 2 * 4
+  cat("AIC:", lognormal.gamma.randomeffect.aic, "\n")
+  
+} else {
+  cat("\n警告：最佳化可能未收斂，代碼:", lognormal.gamma.randomeffect$convergence, "\n")
+    lognormal.gamma.randomeffect.aic <- 2 * lognormal.gamma.randomeffect$value + 2 * 4
+  cat("AIC:", lognormal.gamma.randomeffect.aic, "\n")
+    cat("參數:", lognormal.gamma.randomeffect$par, "\n")
+
+}
+```
+
+```{r}
+# 假設最佳化結果存於 lognormal.gamma.randomeffect
+beta0 <- lognormal.gamma.randomeffect$par[1]
+beta1 <- lognormal.gamma.randomeffect$par[2]
+log_delta <- lognormal.gamma.randomeffect$par[3]
+log_kappa <- lognormal.gamma.randomeffect$par[4]
+
+delta <- exp(log_delta)
+kappa <- exp(log_kappa)
+
+stress_levels <- unique(copper_data$stress)
+sigma_results_ln_gamma <- data.frame()
+
+for(stress in stress_levels) {
+    # 提取當前應力水準數據
+    current_data <- copper_data[copper_data$stress == stress, ]
+    life_times <- current_data$cycles
+    log_times <- log(life_times)
+    cens <- current_data$censoring 
+    n_f <- sum(cens == 1)         
+    
+    # 計算 μ_j = β₀ + β₁ * log(S - γ)
+    stress_adj <- stress 
+    if(stress_adj <= 0) next 
+    mu_j <- beta0 + beta1 * log(stress_adj)
+
+    # 核心積分邏輯函數
+    calc_integral_ln_gamma <- function(type = "D") {
+        integrand <- function(sigma_j_2) {
+            sapply(sigma_j_2, function(s2) {
+                if(s2 <= 0) return(0)
+                sigma_j <- sqrt(s2)
+                
+                # 標準化殘差 z
+                z <- (log_times - mu_j) / sigma_j
+                
+                # --- 對數常態似然 (Lognormal Likelihood with Censoring) ---
+                log_lik <- sum(ifelse(cens == 1, 
+                                      dnorm(z, log = TRUE) - log(sigma_j) - log_times, 
+                                      pnorm(z, lower.tail = FALSE, log.p = TRUE)))
+                
+                # --- 【關鍵修改】伽馬先驗 (Gamma Prior on sigma^2) ---
+                # log_prior = (delta-1)*log(s2) - kappa*s2 + delta*log(kappa) - lgamma(delta)
+                log_prior <- (delta - 1) * log(s2) - (kappa * s2) + 
+                             (delta * log(kappa)) - lgamma(delta)
+                
+                # 結合似然與先驗
+                log_target <- log_lik + log_prior
+                
+                # 計算期望值的分子時，額外乘上 sigma_j^2
+                if(type == "N") log_target <- log_target + log(s2)
+                
+                # 數值穩定性處理
+                if(is.na(log_target) || log_target < -700) return(0)
+                if(log_target > 700) log_target <- 700 
+                return(exp(log_target))
+            })
+        }
+        
+        # 進行數值積分
+        integrate(integrand, lower = 0, upper = Inf, 
+                  rel.tol = 1e-10, abs.tol = 1e-12)$value
+    }
+
+    # 計算後驗期望值 E[sigma^2 | Data] = 分子 / 分母
+    denominator <- calc_integral_ln_gamma(type = "D")
+    numerator   <- calc_integral_ln_gamma(type = "N")
+    
+    sigma_j_squared <- numerator / denominator
+    
+    # 儲存結果
+    sigma_results_ln_gamma <- rbind(sigma_results_ln_gamma, 
+                                     data.frame(stress_level = stress,
+                                                sigma_j_squared = sigma_j_squared,
+                                                sigma_j = sqrt(sigma_j_squared),
+                                                num_failures = n_f,
+                                                num_runouts = sum(cens == 0)))
+}
+
+print(sigma_results_ln_gamma)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# 1. 整理參數：使用從對數常態期望值計算得出的 sigma_j_vector
+# 參數順序：[beta0, beta1, sigma_j1, ..., sigma_jk, gamma]
+
+n_sigma_ln <- length(sigma_results_ln_gamma$sigma_j)
+
+randomeffect.par.lognormal <- c(beta0, beta1, sigma_results_ln_gamma$sigma_j)
+
+stress.list <-sigma_results_ln_gamma$stress_level
+
+# 2. 優化對數常態分位數計算函數
+get_lognormal_quantile <- function(p, par, stress, stress_index) {
+  # 參數解析
+  b0 <- par[1]
+  b1 <- par[2]
+  s_j <- par[2 + stress_index]     # 對應應力水準的 sigma_j 點估計值
+  
+  # 位置參數 mu_j = beta0 + beta1 * log(stress - gamma) [cite: 113]
+  location <- b0 + b1 * log(stress)
+  
+  # 對數常態分位數公式：log(Life)_p = mu + sigma * Phi^-1(p) 
+  # qnorm(p) 是標準常態分佈的分位數函數
+  log_cycle <- location + s_j * qnorm(p)
+  
+  return(exp(log_cycle))
+}
+
+# 3. 批量生成分位數線數據
+# 這裡定義 stress.list 為您想繪圖的應力範圍
+probs <- c(0.1, 0.5, 0.9)
+line_data_lognormal <- expand.grid(sigma = stress.list, p = probs) %>%
+  group_by(p) %>%
+  mutate(index = row_number()) %>%
+  rowwise() %>%
+  mutate(cycle = get_lognormal_quantile(p, randomeffect.par.lognormal, sigma, index)) %>%
+  ungroup() %>%
+  mutate(p_label = scales::percent(p))
+
+
+
+
+library(ggplot2)
+library(scales)
+
+ggplot(copper_data, aes(x = cycles, y = stress)) +
+  # 1. 散佈點層
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(
+    values = c("0" = 2, "1" = 16),
+    labels = c("0" = "Runout", "1" = "Failure"),
+    name = "Status"
+  ) +
+  
+  # 2. 擬合線層 (顏色映射到 p_label)
+  geom_path(data = line_data_lognormal, 
+            aes(x = cycle, y = sigma, color = p_label, group = p_label), 
+            linewidth = 1) +
+  
+  # 3. 設定自定義顏色
+  scale_color_manual(
+    values = c(
+      "10%"  = "green", 
+      "50%"  = "red", 
+      "90%"  = "purple"
+    )
+  ) +
+  
+  # 4. 座標軸設定
+  scale_x_continuous(
+    trans = "log", 
+    breaks = scales::trans_breaks("log10", function(x) 10^x),
+    labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x))
+  ) +
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  
+  # 5. 標籤與主題
+  labs(
+    title = "S-N diagram for annealed electrolytic copper wire",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+```{r}
+library(ggplot2)
+
+log_delta <- lognormal.gamma.randomeffect$par[3]
+log_kappa <- lognormal.gamma.randomeffect$par[4]
+
+delta <- exp(log_delta)
+kappa <- exp(log_kappa)
+# 2. 定義逆伽馬 PDF 函數
+
+# 2. 定義 Gamma PDF 函數 (對應你模型中的隨機效應先驗)
+gamma_pdf <- function(x, alpha, beta) {
+  log_pdf <- alpha * log(beta) - lgamma(alpha) + (alpha - 1) * log(x) - (beta * x)
+  result <- exp(log_pdf)
+  result[x <= 0] <- 0
+  return(result)
+}
+
+# 3. 設定合理的繪圖範圍
+mean_val <- delta / kappa  # 平均值約 0.19
+# 由於 delta < 1，分佈高度集中在 0 附近，我們畫到平均值的 4 倍即可
+max_x <- mean_val * 4
+x_range <- seq(1e-5, max_x, length.out = 1000)
+
+# 4. 建立資料表
+df_pdf_lognormal <- data.frame(
+  sigma_sq = x_range,
+  density = gamma_pdf(x_range, delta, kappa)
+)
+
+# 5. 繪圖
+ggplot(df_pdf_lognormal, aes(x = sigma_sq, y = density)) +
+  geom_area(fill = "skyblue", alpha = 0.4) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  # 標示平均值 (因為 delta < 1 時眾數為 0)
+  geom_vline(xintercept = mean_val, linetype = "dashed", color = "red") +
+  annotate("text", x = mean_val, y = max(df_pdf_lognormal$density) * 0.8, 
+           label = paste("Mean =", round(mean_val, 4)), 
+           hjust = -0.1, color = "red") +
+  labs(
+    title = "Gamma PDF of Random Effect (Variance Sigma^2)",
+    subtitle = paste0("Parameters: delta (shape) = ", round(delta, 3), 
+                      ", kappa (rate) = ", round(kappa, 3)),
+    x = expression(paste("Random Effect Variance ", sigma^2)),
+    y = "Probability Density"
+  ) +
+  # 限制 Y 軸，避免 0 附近的無限大值撐破圖表
+  coord_cartesian(ylim = c(0, gamma_pdf(mean_val/2, delta, kappa) * 2)) +
+  theme_minimal()
+```
+
+
+
+# Weibull 
+
+```{r}
+neg.wei.likelihood.copper.gamma.randomeffect.optimized <- function(par, copper_data) {
+  
+  # 1. 參數解析與變換
+
+  beta0 <- par[1]
+  beta1 <- par[2]
+  delta <- exp(par[3])  # Gamma Shape (形狀參數)
+  kappa <- exp(par[4])  # Gamma Rate (速率參數)
+
+  stress_levels <- unique(copper_data$stress)
+  total_log_likelihood <- 0
+  
+  # 3. 針對每個應力水準進行計算
+  for(stress in stress_levels) {
+    # 提取當前應力水準數據
+   current_data <- copper_data[copper_data$stress == stress, ]
+    log_times <- log(current_data$cycles)
+    cens <- current_data$censoring  # 1=失效, 0=截尾
+    n_j <- length(log_times)
+    
+    # 計算 μ_j = β₀ + β₁ * log(S - γ)
+    mu_j <- beta0 + beta1 * log(stress )
+    
+    # 計算 Jacobian 項 (僅失效樣本需考慮 -log(t))
+    log_jacobian <- -sum(log_times[cens == 1])
+    
+    # 4. 定義被積函數 (向量化版本)
+    integrand <- function(sigma_sq) {
+      vapply(sigma_sq, function(s2) {
+        if(s2 <= 0) return(0)
+        s <- sqrt(s2)
+        
+        # 標準化殘差 z
+        z <- (log_times - mu_j) / s
+        
+        # --- 韋伯似然 (Weibull Likelihood with Censoring) ---
+        log_lik_per_obs <- ifelse(cens == 1, 
+                                  -log(s) + z - exp(z), 
+                                  -exp(z))
+        
+        # --- 【關鍵修改】伽馬先驗 (Gamma Prior on sigma^2) ---
+        # 公式：(delta-1)*log(s2) - kappa*s2 + delta*log(kappa) - lgamma(delta)
+        log_prior <- (delta - 1) * log(s2) - (kappa * s2) + 
+                     (delta * log(kappa)) - lgamma(delta)
+        
+        # 總對數似然
+        log_total <- sum(log_lik_per_obs) + log_prior
+        
+        # 數值穩定性處理
+        if(!is.finite(log_total) || log_total < -700) return(0)
+        if(log_total > 700) log_total <- 700
+        
+        return(exp(log_total))
+      }, numeric(1))
+    }
+    
+    # 5. 執行數值積分
+    # 對於 Gamma 分佈，如果 delta < 1，在 0 附近可能會有奇點，lower = 1e-10 是安全的做法
+    integration <- try(integrate(integrand, lower = 1e-10, upper = Inf, 
+                                 rel.tol = 1e-8, abs.tol = 1e-10), silent = TRUE)
+    
+    if(inherits(integration, "try-error") || integration$value <= 0) {
+      return(1e10)
+    }
+    
+    total_log_likelihood <- total_log_likelihood + log_jacobian + log(integration$value)
+  }
+  
+  neg_ll <- -total_log_likelihood
+  return(ifelse(is.finite(neg_ll), neg_ll, 1e10))
+}
+```
+
+
+
+```{r}
+# 設定初始參數 - 現在包含5個參數
+randomeffect.par <- c(30,-5,  -0.8390395, -0.1044678 )  # 加入gamma參數
+names(randomeffect.par) <- c("beta0", "beta1", "log_delta", "log_kappa")
+
+# 參數解釋
+cat("初始參數:\n")
+cat("beta0 =", randomeffect.par[1], "\n")
+cat("beta1 =", randomeffect.par[2], "\n") 
+cat("delta =", exp(randomeffect.par[3]), "\n")
+cat("kappa =", exp(randomeffect.par[4]), "\n")
+
+# 檢查資料
+cat("=== 資料診斷 ===\n")
+str(copper_data)
+cat("應力水準:", unique(copper_data$stress), "\n")
+cat("最小應力值:", min(copper_data$stress), "\n")
+cat("生命週期範圍:", range(copper_data$cycles), "\n\n")
+
+
+
+
+lower_bounds <- c(-Inf, -Inf, log(0.01), log(1e-8))  
+upper_bounds <- c(Inf, Inf, log(100000), log(1e6))
+# 進行最佳化
+cat("開始最佳化...\n")
+weibull.gamma.randomeffect <- optim(
+  par = randomeffect.par, 
+  fn = neg.wei.likelihood.copper.gamma.randomeffect.optimized,
+  copper_data = copper_data,
+  method = "L-BFGS-B",
+  lower = lower_bounds,
+  upper = upper_bounds,
+  hessian = TRUE,
+  control = list(
+    trace = 1,
+    maxit = 2000,
+    factr = 1e7
+  )
+)
+
+# 檢查收斂狀況並顯示結果
+if(weibull.gamma.randomeffect$convergence == 0) {
+  cat("\n最佳化成功收斂！\n")
+  
+  cat("\n=== 最佳化結果 ===\n")
+  cat("最終負對數似然值:", weibull.gamma.randomeffect$value, "\n")
+  cat("最佳參數:\n")
+  cat("beta0 =", weibull.gamma.randomeffect$par[1], "\n")
+  cat("beta1 =", weibull.gamma.randomeffect$par[2], "\n")
+  cat("delta =", exp(weibull.gamma.randomeffect$par[3]), "\n")
+  cat("kappa =", exp(weibull.gamma.randomeffect$par[4]), "\n")
+
+  # AIC 計算 (5個參數)
+  weibull.gamma.randomeffect.aic <- 2 * weibull.gamma.randomeffect$value + 2 * 4
+  cat("AIC:", weibull.gamma.randomeffect.aic, "\n")
+  
+} else {
+  cat("\n警告：最佳化可能未收斂，代碼:", weibull.gamma.randomeffect$convergence, "\n")
+    cat("最終負對數似然值:", weibull.gamma.randomeffect$par, "\n")
+
+}
+```
+
+```{r}
+# 假設最佳化結果存於 weibull.gamma.randomeffect
+beta0 = weibull.gamma.randomeffect$par[1]
+beta1 = weibull.gamma.randomeffect$par[2]
+
+# Gamma 分佈參數 (Shape = delta, Rate = kappa)
+delta <- exp(weibull.gamma.randomeffect$par[3]) 
+kappa <- exp(weibull.gamma.randomeffect$par[4])
+stress_levels <- unique(copper_data$stress)
+
+sigma_results_gamma <- data.frame()
+
+for(stress in stress_levels) {
+    # 提取數據
+    current_data <- copper_data[copper_data$stress == stress, ]
+    life_times <- current_data$cycles
+    cens <- current_data$censoring      # 1=失效, 0=截尾
+    n_f <- sum(cens == 1)               # 失效樣本數
+    log_times <- log(life_times)
+    
+    # 計算 μ_j
+    stress_adjusted <- stress 
+    if(stress_adjusted <= 0) next
+    mu_j <- beta0 + beta1 * log(stress_adjusted)
+    
+    ###########################################################################
+    # 定義核心似然計算函數 (針對 Gamma Prior)
+    ###########################################################################
+    get_integrand_gamma <- function(type = "D") {
+        return(function(sigma_j_2) {
+            sigma_j_2 <- as.numeric(sigma_j_2)
+            results <- numeric(length(sigma_j_2))
+            
+            for(i in seq_along(sigma_j_2)) {
+                s2 <- sigma_j_2[i]
+                if(s2 <= 0) { results[i] <- 0; next }
+                
+                s <- sqrt(s2)
+                z <- (log_times - mu_j) / s
+                
+                # --- 韋伯似然項 ---
+                weibull_log_lik_parts <- ifelse(cens == 1, z - exp(z), -exp(z))
+                log_lik_sum <- sum(weibull_log_lik_parts)
+                
+                # --- 【關鍵修改】冪次項與先驗項 (Gamma 版) ---
+                # 韋伯 PDF 貢獻 s^(-n_f) = (s2)^(-n_f/2)
+                # Gamma Prior 貢獻 (s2)^(delta - 1)
+                # 分母 (D) 總權重: s2^(-n_f/2 + delta - 1)
+                # 分子 (N) 總權重: s2^(-n_f/2 + delta)  (多乘一個 s2)
+                if (type == "D") {
+                    power_term <- -n_f/2 + delta - 1
+                } else {
+                    power_term <- -n_f/2 + delta
+                }
+                
+                # Gamma 的指數項是 -kappa * s2 (注意：不再是 -kappa / s2)
+                exp_term <- -kappa * s2
+                
+                # 總對數結果
+                log_result <- power_term * log(s2) + log_lik_sum + exp_term
+                
+                # 數值穩定保護
+                if(is.na(log_result) || log_result < -700) {
+                    results[i] <- 0
+                } else if(log_result > 700) {
+                    results[i] <- exp(700) 
+                } else {
+                    results[i] <- exp(log_result)
+                }
+            }
+            return(results)
+        })
+    }
+    
+    ###########################################################################
+    # 執行積分
+    ###########################################################################
+    # 分母積分 (邊際似然)
+    int_den <- integrate(get_integrand_gamma("D"), lower = 0, upper = Inf, 
+                         rel.tol = 1e-10, abs.tol = 1e-12)
+    
+    # 分子積分
+    int_num <- integrate(get_integrand_gamma("N"), lower = 0, upper = Inf, 
+                         rel.tol = 1e-10, abs.tol = 1e-12)
+    
+    # 計算後驗期望值 E[sigma^2 | data]
+    sigma_j_squared <- int_num$value / int_den$value
+    
+    # 儲存結果
+    sigma_results_gamma <- rbind(sigma_results_gamma, 
+                                 data.frame(stress_level = stress,
+                                            sigma_j_squared = sigma_j_squared,
+                                            sigma_j = sqrt(sigma_j_squared),
+                                            n_fail = n_f,
+                                            n_runout = sum(cens == 0)))
+}
+
+print(sigma_results_gamma)
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# 1. 整理參數：自動適應參數長度，避免硬編碼 "12parm"
+# 假設格式為 [beta0, beta1, sigma_j1, ..., sigma_jk, gamma]
+sigma_j_vector <- sigma_results_gamma$sigma_j
+n_sigma <- sigma_j_vector
+randomeffect.par.weibull <- c(beta0, beta1, sigma_j_vector, gamma)
+
+# 2. 優化分位數計算函數：更具通用性
+get_weibull_quantile <- function(p, par, stress, stress_index) {
+  # 參數解析
+  b0 <- par[1]
+  b1 <- par[2]
+  g  <- par[length(par)] # 最後一個是 gamma
+  s_j <- par[2 + stress_index] # sigma 參數區間
+  
+  # 位置參數 mu_j [cite: 113]
+  location <- b0 + b1 * log(stress - g)
+  
+  # 韋伯分佈（極值分佈）分位數公式
+  # log(Life)_p = mu + sigma * log(-log(1-p))
+  log_cycle <- location + s_j * log(-log(1 - p))
+  return(exp(log_cycle))
+}
+
+# --- 修正後的步驟 3：生成分位數數據 ---
+probs <- c(0.1, 0.5, 0.9)
+quantile_lines <- expand.grid(sigma = stress.list, p = probs) %>% # 這裡把 stress 改成 sigma
+  group_by(p) %>%
+  mutate(index = row_number()) %>%
+  rowwise() %>%
+  # 這裡把結果存為 cycles (複數)，對應原始資料
+  mutate(cycles = get_weibull_quantile(p, randomeffect.par.weibull, sigma, index)) %>%
+  ungroup() %>%
+  mutate(p_label = factor(scales::percent(p)))
+
+# 重新分割資料表
+line_data_10.weibull.randomeffect <- quantile_lines %>% filter(p == 0.1)
+line_data_50.weibull.randomeffect <- quantile_lines %>% filter(p == 0.5)
+line_data_90.weibull.randomeffect <- quantile_lines %>% filter(p == 0.9)
+
+
+
+
+
+ggplot(copper_data, aes(x = cycles, y = stress)) + # [修正1] 這裡直接用原始變數，不要加 log()
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(
+    values = c("0" = 2, "1" = 16),
+    labels = c("0" = "Runout", "1" = "Failure"),
+    name = "Status"
+  ) +
+  geom_path(data = arrange(line_data_50.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "50%", linetype = "Weibull"), linewidth = 1) +
+  geom_path(data = arrange(line_data_10.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "10%", linetype = "Weibull"), linewidth = 1) +
+  geom_path(data = arrange(line_data_90.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "90%", linetype = "Weibull"), linewidth = 1) +
+  scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+  
+  # Y 軸：讓 ggplot 負責轉 log
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  
+
+
+  scale_color_manual(
+    values = c("10%" = "green", "50%" = "red", "90%" = "purple", "1%"="gray")
+  ) +
+  scale_linetype_manual(
+    values = c("Weibull" = "solid")
+  ) +
+  
+  labs(
+    title = " S-N diagram of Model 1 for annealed electrolytic copper wire ",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+theme_minimal() +
+theme(
+   text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+   # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+   plot.title = element_text(
+     size = 12,        # 設定標題字體大小 (例如 20)
+     face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+     hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+   ),
+   
+   legend.position = "right"
+ )
+```
+
+```{r}
+library(ggplot2)
+
+log_delta <- weibull.gamma.randomeffect$par[3]
+log_kappa <- weibull.gamma.randomeffect$par[4]
+
+delta <- exp(log_delta)
+kappa <- exp(log_kappa)
+# 2. 定義逆伽馬 PDF 函數
+
+
+# 2. 定義 Gamma PDF 函數 (對應你模型中的隨機效應先驗)
+gamma_pdf <- function(x, alpha, beta) {
+  log_pdf <- alpha * log(beta) - lgamma(alpha) + (alpha - 1) * log(x) - (beta * x)
+  result <- exp(log_pdf)
+  result[x <= 0] <- 0
+  return(result)
+}
+
+# 3. 設定合理的繪圖範圍
+mean_val <- delta / kappa  # 平均值約 0.19
+# 由於 delta < 1，分佈高度集中在 0 附近，我們畫到平均值的 4 倍即可
+max_x <- mean_val * 4
+x_range <- seq(1e-5, max_x, length.out = 1000)
+
+# 4. 建立資料表
+df_pdf_weibull <- data.frame(
+  sigma_sq = x_range,
+  density = gamma_pdf(x_range, delta, kappa)
+)
+
+# 5. 繪圖
+ggplot(df_pdf_weibull, aes(x = sigma_sq, y = density)) +
+  geom_area(fill = "skyblue", alpha = 0.4) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  # 標示平均值 (因為 delta < 1 時眾數為 0)
+  geom_vline(xintercept = mean_val, linetype = "dashed", color = "red") +
+  annotate("text", x = mean_val, y = max(df_pdf_weibull$density) * 0.8, 
+           label = paste("Mean =", round(mean_val, 4)), 
+           hjust = -0.1, color = "red") +
+  labs(
+    title = "Gamma PDF of Random Effect (Variance Sigma^2)",
+    subtitle = paste0("Parameters: delta (shape) = ", round(delta, 3), 
+                      ", kappa (rate) = ", round(kappa, 3)),
+    x = expression(paste("Random Effect Variance ", sigma^2)),
+    y = "Probability Density"
+  ) +
+  # 限制 Y 軸，避免 0 附近的無限大值撐破圖表
+  coord_cartesian(ylim = c(0, gamma_pdf(mean_val/2, delta, kappa) * 2)) +
+  theme_minimal()
+```
+
+# 兩分佈
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. 幫資料表加上標籤 (以便區分)
+df_pdf_lognormal <- df_pdf_lognormal %>% mutate(Model = "Lognormal")
+df_pdf_weibull <- df_pdf_weibull %>% mutate(Model = "Weibull")
+
+# 2. 合併資料表
+df_plot <- bind_rows(df_pdf_lognormal, df_pdf_weibull)
+
+# 3. 繪圖
+ggplot(df_plot, aes(x = sigma_sq, y = density, color = Model, fill = Model)) +
+  # 使用 geom_area 繪製半透明填充
+  #geom_area(position = "identity", alpha = 0.2) +
+  # 使用 geom_line 繪製外框線
+  geom_line(linewidth = 1) +
+  
+  # 設定 X 軸標籤與數學符號
+  labs(
+    title = "Comparison of Random Effect Distributions ( Gamma )",
+    subtitle = "Gamma PDF for Scale Parameter σ²",
+    x = expression(paste("scale parameter ", sigma^2)),
+    y = "density",
+    color = "Distribution",
+    fill = "Distribution"
+  ) +
+  
+  # 自定義顏色 (可自行修改)
+  scale_color_manual(values = c("Lognormal" = "#E41A1C", 
+                               "Weibull" = "#377EB8")) +
+  #scale_fill_manual(values = c("Lognormal Random Effect" = "#E41A1C", 
+  #                             "Weibull Random Effect" = "#377EB8")) +
+  
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    
+    # 主標題設定
+    plot.title = element_text(
+        size = 12,        
+        face = "bold",    
+        hjust = 0.5       # 主標題置中
+      ),
+    
+    # 副標題設定 (新增這部分)
+    plot.subtitle = element_text(
+        size = 10,        # 通常副標題會比主標題小一點
+        hjust = 0.5       # 副標題置中
+      ),
+      
+    legend.position = "right"
+  )
+```
+
+
+```{r}
+ggplot(copper_data, aes(x = cycles, y = stress)) + # [修正1] 這裡直接用原始變數，不要加 log()
+  geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+  scale_shape_manual(
+    values = c("0" = 2, "1" = 16),
+    labels = c("0" = "Runout", "1" = "Failure"),
+    name = "Status"
+  ) +
+  geom_path(data = arrange(line_data_50.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "50%", linetype = "Weibull"), linewidth = 1) +
+  geom_path(data = arrange(line_data_10.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "10%", linetype = "Weibull"), linewidth = 1) +
+  geom_path(data = arrange(line_data_90.weibull.randomeffect, desc(sigma)), 
+            aes(x = cycles, y = sigma, color = "90%", linetype = "Weibull"), linewidth = 1) +
+    # 2. 擬合線層 (顏色映射到 p_label)
+  geom_path(data = line_data_lognormal, 
+            aes(x = cycle, y = sigma, color = p_label, group = p_label,linetype = "Lognormal"), 
+            linewidth = 1) +
+  
+  scale_x_continuous(
+      # 1. 將座標軸轉換為自然對數 (ln) 尺度，這與 plnorm 的計算基礎一致
+      trans = "log", 
+      
+      # 2. 定義斷點：以 10 為底，從 10^0.5 到 10^3，步長為 0.5 次方
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      
+      # 3. 處理標籤：將數值轉回 log10 的指數並格式化為 10^x
+      # 這裡使用自定義函數將自然對數尺度的值轉為 10 為底的表達式
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x)),
+      
+      # 4. 限制顯示範圍 (選擇性)
+      #limits = c(10^0.4, 10^3.1) 
+    )+
+  
+  # Y 軸：讓 ggplot 負責轉 log
+  scale_y_continuous(
+    trans = "log",
+    labels = label_number(accuracy = 0.1)
+  ) +
+  
+
+
+  scale_color_manual(
+    values = c("10%" = "green", "50%" = "red", "90%" = "purple", "1%"="gray")
+  ) +
+  scale_linetype_manual(
+    values = c("Weibull" = "dashed","Lognormal"="solid")
+  ) +
+  
+  labs(
+    title = " S-N Diagram of Model 3 (Inv-Gamma) for Annealed Electrolytic Copper Wire ",
+    x = "thousands of cycles",
+    y = "stress",
+    color = "Quantile",
+    linetype = "Distribution"
+  ) +
+theme_minimal() +
+theme(
+   text = element_text(size = 12),          # 這是所有文字的預設大小
+   
+   # 修改這裡：針對標題 (plot.title) 設定字體大小與粗體
+   plot.title = element_text(
+     size = 12,        # 設定標題字體大小 (例如 20)
+     face = "bold",    # 設定粗體 (可選，通常標題用粗體較好看)
+     hjust = 0.5       # 設定置中 (0=靠左, 0.5=置中, 1=靠右)
+   ),
+   
+   legend.position = "right"
+ )
+```

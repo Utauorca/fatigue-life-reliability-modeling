@@ -1,0 +1,994 @@
+---
+title: "Model_summary"
+author: "謝柏陞"
+date: "2026-02-04"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage[fontset=none]{ctex}
+  - \setCJKmainfont{DFKai-SB} 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  dev = "png",         
+  dpi = 300,           
+  fig.retina = 2,      
+  fig.width = 8,        
+  fig.height = 5,        
+  out.width = "90%",    
+  fig.align = "center"  
+)
+```
+
+## 引入資料
+
+```{r}
+library(tidyverse)
+data <- read_csv("copper_fatigue_data.csv")
+head(data)
+```
+## 模型主程式
+```{r}
+
+get_fatigue_nll_func <- function(model_type = 1, dist = "lnorm", use_gamma = TRUE) {
+  
+  function(par, data.t, data.censored, Stress.Amplitude) {
+    min_stress <- min(Stress.Amplitude)
+    
+    # 如果 use_gamma = TRUE: 
+    #   Model 1: 4 參數 (b0_mu, b1_mu, sigma, gamma) 
+    #   Model 2: 5 參數 (b0_mu, b1_mu, b0_si, b1_si, gamma) 
+    # 如果 use_gamma = FALSE:
+    #   Model 1: 3 參數 (b0_mu, b1_mu, sigma) 且 gamma = 0 
+    #   Model 2: 4 參數 (b0_mu, b1_mu, b0_si, b1_si) 且 gamma = 0 
+    
+    if (use_gamma) {
+      gamma <- if(model_type == 1) par[4] else par[5]
+      if(gamma >= min_stress || gamma <= 0) return(1e10)
+    } else {
+      gamma <- 0 # 不含疲勞極限模型 
+    }
+    
+    stress_diff <- Stress.Amplitude - gamma
+    if(any(stress_diff <= 0)) return(1e10)
+    
+    # mu ：beta0 + beta1 * log(S - gamma) 
+    mu <- par[2] * log(stress_diff) + par[1]
+    
+    # sigma 
+    if(model_type == 1) {
+      sigma <- par[3] 
+      if(sigma <= 0) return(1e10)
+    } else {
+      sigma <- exp(par[4] * log(Stress.Amplitude) + par[3])
+      if(any(sigma <= 0) || any(!is.finite(sigma))) return(1e10)
+    }
+    
+    # 分佈計算 (lnorm 與 weibull) 
+    if(dist == "lnorm") {
+      log_dens <- dlnorm(data.t, mu, sigma, log = TRUE)
+      log_surv <- log(1 - pmin(plnorm(data.t, mu, sigma), 1 - 1e-15))
+    } else {
+      z <- (log(data.t) - mu) / sigma
+      z <- pmax(pmin(z, 700), -700) 
+      log_dens <- -log(sigma) - log(data.t) + z - exp(z)
+      log_surv <- -exp(z)
+    }
+    
+    lj <- data.censored * log_dens + (1 - data.censored) * log_surv
+    result <- -sum(lj)
+    return(if(is.finite(result)) result else 1e10)
+  }
+}
+```
+
+## 最佳化內初始值、上下界設置及執行
+```{r}
+
+fit_fatigue_model <- function(data, model_type = 1, dist = "lnorm", use_gamma = TRUE, initial_params = NULL) {
+  
+  # 1. 確保概似函數知道是否要估計 gamma
+  nll_func <- get_fatigue_nll_func(model_type, dist, use_gamma = use_gamma)
+  min_s <- min(data$stress)
+  
+  # 2. 設定初始值
+  if(is.null(initial_params)) {
+    if (use_gamma) {
+      # 含 gamma (Model 1: 4個, Model 2: 5個)
+      initial_params <- if(model_type == 1) c(16, -1.8, 0.6, 70) else c(15, -1.5, 11, -2.5, 70)
+    } else {
+      # 不含 gamma (Model 1: 3個, Model 2: 4個)
+      initial_params <- if(model_type == 1) c(16, -1.8, 0.6) else c(15, -1.5, 11, -2.5)
+    }
+  }
+  
+  # 3. 設定 L-BFGS-B 的邊界
+  n_par <- length(initial_params)
+  low_b <- rep(-Inf, n_par)
+  up_b <- rep(Inf, n_par)
+  
+  # 如果有 gamma，最後一個參數是 gamma，需設定邊界
+  if (use_gamma) {
+    low_b[n_par] <- 0           # gamma > 0
+    up_b[n_par] <- min_s - 0.001 # gamma < min_stress
+  }
+  
+  # 設定 sigma 必須為正值 
+  if(model_type == 1) low_b[3] <- 0.0001 
+  
+  # 4. 執行優化
+  fit <- optim(
+    par = initial_params,
+    fn = nll_func,
+    data.t = data$cycles,
+    data.censored = data$censoring,
+    Stress.Amplitude = data$stress,
+    method = "L-BFGS-B",
+    lower = low_b,
+    upper = up_b,
+    hessian = TRUE,
+    control = list(trace = 1)
+  )
+  
+  # 計算 AIC
+  fit$aic <- 2 * n_par + 2 * fit$value
+  return(fit)
+}
+```
+
+# 分位數曲線圖函數
+
+```{r}
+plot_fatigue_comparison <- function(data, fit_lnorm, fit_weibull, 
+                                    m_type_ln = 1, m_type_wb = 1,
+                                    use_gamma_ln = TRUE, use_gamma_wb = TRUE,maintitle="S-N Diagram Comparison") {
+  
+  # 1. 內部輔助函數：計算分位數 
+  get_q <- function(par, p, stress, dist, m_type, use_gamma) {
+    
+    # 根據是否使用 gamma 來判斷參數索引位置 
+    if (use_gamma) {
+      gamma <- if(m_type == 1) par[4] else par[5]
+    } else {
+      gamma <- 0  # 若不含疲勞極限，gamma 固定為 0 
+    }
+    
+    # 計算 mu 
+    loc <- par[2] * log(stress - gamma) + par[1]
+    
+    # 計算 sigma 
+    sig <- if(m_type == 1) {
+      par[3] 
+    } else {
+      # Model 2: sigma = exp(b0_si + b1_si * log(S)) 
+      exp(par[4] * log(stress) + par[3])
+    }
+    
+    if(dist == "lnorm") {
+      # 對數常態分位數 
+      return(qlnorm(p, meanlog = loc, sdlog = sig))
+    } else {
+      # Weibull 分位數 (由 SEV 分佈轉換) 
+      w_p <- log(-log(1 - p))
+      return(exp(loc + sig * w_p))
+    }
+  }
+  
+  # --- 2. 生成繪圖數據線 ---
+  stress_range <- seq(min(data$stress), max(data$stress), length.out = 100)
+  probs <- c(0.1, 0.5, 0.9)
+  
+  plot_lines <- expand.grid(stress = stress_range, p = probs, dist = c("Lognormal", "Weibull")) %>%
+    rowwise() %>%
+    mutate(
+      cycles = if(dist == "Lognormal") {
+        get_q(fit_lnorm$par, p, stress, "lnorm", m_type_ln, use_gamma_ln)
+      } else {
+        get_q(fit_weibull$par, p, stress, "weibull", m_type_wb, use_gamma_wb)
+      },
+      p_label = factor(paste0(p * 100, "%"), levels = c("10%", "50%", "90%"))
+    )
+
+  # --- 3. 繪圖主體 (維持您的原始格式設定) ---
+  p_plot <- ggplot(data, aes(x = cycles, y = stress)) + 
+    geom_point(aes(shape = factor(censoring)), color = "blue", size = 1.5, alpha = 0.7) +
+    scale_shape_manual(
+      values = c("0" = 2, "1" = 16),
+      labels = c("0" = "Runout", "1" = "Failure"),
+      name = "Status"
+    ) +
+    scale_x_continuous(
+      trans = "log", 
+      breaks = scales::trans_breaks("log10", function(x) 10^x),
+      labels = scales::trans_format(function(x) log10(x), scales::math_format(10^.x))
+    ) +
+    scale_y_continuous(
+      trans = "log",
+      labels = scales::label_number(accuracy = 0.1)
+    ) +
+    geom_line(data = plot_lines, 
+              aes(x = cycles, y = stress, color = p_label, linetype = dist),
+              linewidth = 1) +
+    scale_color_manual(values = c("10%" = "green", "50%" = "red", "90%" = "purple")) +
+    scale_linetype_manual(values = c("Lognormal" = "solid", "Weibull" = "dashed")) +
+    labs(
+      title = maintitle,
+#      subtitle = paste0("LN: Model ", m_type_ln, " (Gamma: ", use_gamma_ln, ") | ",
+#                        "WB: Model ", m_type_wb, " (Gamma: ", use_gamma_wb, ")"),
+      x = "thousands of cycles",
+      y = "stress",
+      color = "Quantile",
+      linetype = "Distribution"
+    ) +
+    theme_minimal() +
+    theme(
+      text = element_text(size = 12),
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5),
+      legend.position = "right"
+    )
+  
+  return(p_plot)
+}
+```
+
+## Bootstrap 信賴區間函數
+
+
+```{r}
+
+run_full_bootstrap <- function(data, model_type = 1, dist = "lnorm", 
+                               use_gamma = TRUE, R = 1000, 
+                               use_strata = TRUE, initial_params = NULL) {
+  
+  library(boot)
+  library(broom)
+  library(ggplot2)
+  library(gridExtra)
+
+  # --- 1. 內部統計函數 (確保初始值被正確傳入與微調) ---
+  boot_stat <- function(d, i, m_type, d_type, u_gamma, init_p) {
+    d_sub <- d[i, ]
+    nll_func <- get_fatigue_nll_func(m_type, d_type, u_gamma)
+    min_s <- min(d_sub$stress)
+    
+    # 決定起始值
+    start_p <- if(!is.null(init_p)) init_p else {
+      if(u_gamma) {
+        if(m_type == 1) c(16, -1.8, 0.6, 70) else c(15, -1.5, 11, -2.5, 70)
+      } else {
+        if(m_type == 1) c(16, -1.8, 0.6) else c(15, -1.5, 11, -2.5)
+      }
+    }
+    
+    # 動態檢查 gamma 是否符合邊界 (gamma < min_stress)
+    n_p <- length(start_p)
+    if(u_gamma && start_p[n_p] >= min_s) start_p[n_p] <- min_s - 0.1
+    
+    # 設定邊界
+    low_b <- rep(-Inf, n_p)
+    up_b <- rep(Inf, n_p)
+    if(u_gamma) { low_b[n_p] <- 0; up_b[n_p] <- min_s - 0.001 }
+    if(m_type == 1) low_b[3] <- 0.001
+
+    tryCatch({
+      fit <- optim(par = start_p, fn = nll_func, 
+                   data.t = d_sub$cycles, data.censored = d_sub$censoring, 
+                   Stress.Amplitude = d_sub$stress,
+                   method = "L-BFGS-B", lower = low_b, upper = up_b)
+      return(fit$par)
+    }, error = function(e) return(rep(NA, n_p)))
+  }
+
+  # --- 2. 執行 Bootstrap ---
+  # 設定分層抽樣邏輯
+  strata_arg <- if(use_strata) as.factor(data$stress) else rep(1, nrow(data))
+  
+  set.seed(123)
+  boot_results <- boot(
+    data = data, 
+    statistic = boot_stat, 
+    R = R, 
+    strata = strata_arg,
+    m_type = model_type, d_type = dist, u_gamma = use_gamma, init_p = initial_params
+  )
+
+  # --- 3. 自動命名參數標籤 ---
+  if(model_type == 1) {
+    labels <- c("beta0_mu", "beta1_mu", "sigma")
+  } else {
+    labels <- c("beta0_mu", "beta1_mu", "beta0_si", "beta1_si")
+  }
+  if(use_gamma) labels <- c(labels, "gamma")
+
+  # --- 4. 建立摘要表格 ---
+  boot_summary <- tidy(boot_results, conf.int = TRUE, conf.method = "perc")
+  boot_summary$term <- labels
+  cat("\n--- Bootstrap 參數統計摘要 (95% CI: 2.5% to 97.5%) ---\n")
+  print(boot_summary)
+
+  # --- 5. 繪製分配圖 ---
+  boot_df <- as.data.frame(boot_results$t)
+  colnames(boot_df) <- labels
+  boot_df <- na.omit(boot_df)
+
+  plot_list <- list()
+  for(i in 1:length(labels)) {
+    term_name <- labels[i]
+    p <- ggplot(boot_df, aes(x = .data[[term_name]])) +
+      geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "steelblue", color = "white", alpha = 0.7) +
+      geom_density(color = "red", linewidth = 1) +
+      geom_vline(xintercept = boot_results$t0[i], linetype = "dashed", size = 1) +
+      labs(title = term_name, x = "Estimate Value", y = "Density") +
+      theme_minimal()
+    plot_list[[i]] <- p
+  }
+
+  # 自動排版並輸出
+  grid.arrange(grobs = plot_list, ncol = 2)
+  
+  return(list(boot_obj = boot_results, summary = boot_summary))
+}
+```
+
+
+## LRT 參數顯著性檢定
+```{r}
+perform_LRT <- function(negloglik1, negloglik2, df) {
+  # 計算 LRT 統計量
+  LRT_stat <- 2*(negloglik1 - negloglik2)
+  
+  # 計算 p 值
+  p_val <- pchisq(LRT_stat, df = df, lower.tail = FALSE)
+  
+  # 結果
+  result <- list(
+    LRT_statistic = LRT_stat,
+    df = df,
+    p_value = p_val,
+    significant = p_val < 0.05
+  )
+  
+  # 印出結果
+  cat("=== 似然比檢驗結果 ===\n")
+  cat("LRT 統計量:", round(LRT_stat, 4), "\n")
+  cat("自由度:", df, "\n")
+  cat("p 值:", format(p_val, scientific = TRUE), "\n")
+  cat("顯著性 (α = 0.05):", ifelse(p_val < 0.05, "顯著", "不顯著"), "\n")
+  
+  return(result)
+}
+```
+
+## 結果整理輔助函數
+```{r}
+# 將 lnorm 與 weibull 兩組 fit 結果整理為對照表。
+# model_type 與 use_gamma 決定欄位組成（與 get_fatigue_nll_func 的參數順序一致）。
+build_comparison_table <- function(fit_ln, fit_wb, model_type = 1, use_gamma = TRUE) {
+  tbl <- list(
+    Distribution = c("Lognormal", "Weibull"),
+    AIC = round(c(fit_ln$aic, fit_wb$aic), 4),
+    NLL = round(c(fit_ln$value, fit_wb$value), 4),
+    beta0_mu = round(c(fit_ln$par[1], fit_wb$par[1]), 4),
+    beta1_mu = round(c(fit_ln$par[2], fit_wb$par[2]), 4)
+  )
+
+  if (model_type == 1) {
+    tbl$sigma <- round(c(fit_ln$par[3], fit_wb$par[3]), 4)
+    if (use_gamma) tbl$fatigue_limit <- round(c(fit_ln$par[4], fit_wb$par[4]), 4)
+  } else {
+    tbl$sigma_0 <- round(c(fit_ln$par[3], fit_wb$par[3]), 4)
+    tbl$sigma_1 <- round(c(fit_ln$par[4], fit_wb$par[4]), 4)
+    if (use_gamma) tbl$fatigue_limit <- round(c(fit_ln$par[5], fit_wb$par[5]), 4)
+  }
+
+  tbl$Convergence <- c(fit_ln$convergence, fit_wb$convergence)
+  as.data.frame(tbl)
+}
+
+# 從 bootstrap 物件取出指定參數的 BCa 95% CI 並印出（預設取 gamma，index = 4）
+print_gamma_bca_ci <- function(boot_obj, index = 4) {
+  ci <- boot::boot.ci(boot_obj, type = "bca", index = index)
+  cat(sprintf("BCa 95%% CI for gamma: [%.4f, %.4f]\n", ci$bca[4], ci$bca[5]))
+  invisible(ci)
+}
+```
+
+## 模型一
+```{r}
+par.hat.lognormal.model1.nofatigue <- fit_fatigue_model(
+  data = data, 
+  model_type = 1, 
+  dist = "lnorm",
+  initial_params = c(11.9094,	-2.3385,	0.5309),
+  use_gamma = FALSE
+  
+)
+par.hat.lognormal.model1.nofatigue$par
+par.hat.weibull.model1.nofatigue <- fit_fatigue_model(
+  data = data, 
+  model_type = 1, 
+  dist = "weibull",
+  initial_params = c(11.9094,	-2.3385,	0.5309),
+  use_gamma = FALSE
+)
+
+
+comparison_table_m1_nofatigue <- build_comparison_table(
+  par.hat.lognormal.model1.nofatigue, par.hat.weibull.model1.nofatigue,
+  model_type = 1, use_gamma = FALSE
+)
+print(comparison_table_m1_nofatigue)
+
+```
+
+```{r}
+plot_fatigue_comparison(
+  data = data, 
+  fit_lnorm = par.hat.lognormal.model1.nofatigue, 
+  fit_weibull = par.hat.weibull.model1.nofatigue,
+  m_type_ln = 1, m_type_wb = 1,
+  use_gamma_ln = FALSE, use_gamma_wb = FALSE,
+  maintitle = "S-N diagram of Model 1 for nickel-based superalloy specimens"
+  )
+
+```
+
+## 模型一\*
+
+```{r}
+par.hat.lognormal.model1 <- fit_fatigue_model(
+  data = data, 
+  model_type = 1, 
+  dist = "lnorm",
+  initial_params = c(6.0172,	-1.4358	,0.1477	,6) 
+)
+
+par.hat.weibull.model1 <- fit_fatigue_model(
+  data = data, 
+  model_type = 1, 
+  dist = "weibull",
+  initial_params =  c(6.549,-1.318,0.216,6.455 ) 
+)
+
+
+comparison_table_m1 <- build_comparison_table(
+  par.hat.lognormal.model1, par.hat.weibull.model1,
+  model_type = 1, use_gamma = TRUE
+)
+print(comparison_table_m1)
+
+```
+
+```{r}
+# 假設您已經跑完 optim 得到 par.hat.lognormal.model1 和 par.hat.weibull.model1
+plot_fatigue_comparison(
+  data = data, 
+  fit_lnorm = par.hat.lognormal.model1, 
+  fit_weibull = par.hat.weibull.model1,
+  m_type_ln = 1, m_type_wb = 1,
+  maintitle = "S-N diagram of Model 1* for nickel-based superalloy specimens"
+)
+
+```
+
+
+# 模型一\* 信賴區間 (第一類資料)
+```{r}
+mode1_fatigue_ci_LN <- run_full_bootstrap(
+  data = data, 
+  model_type = 1, 
+  dist = "lnorm", 
+  use_gamma = TRUE, 
+  use_strata = TRUE,  # 第一類資料：採用分層抽樣
+  initial_params = par.hat.lognormal.model1$par # 初始值設置成MLE結果
+)
+
+print_gamma_bca_ci(mode1_fatigue_ci_LN$boot_obj, index = 4)
+```
+
+```{r}
+mode1_fatigue_ci_WB <- run_full_bootstrap(
+  data = data,
+  model_type = 1,
+  dist = "weibull",
+  use_gamma = TRUE,
+  use_strata = TRUE, # 第一類資料：採用分層抽樣
+  initial_params = par.hat.weibull.model1$par # 初始值設置成MLE結果
+)
+
+print_gamma_bca_ci(mode1_fatigue_ci_WB$boot_obj, index = 4)
+```
+
+
+# 模型一\* 信賴區間 (第二類資料)
+```{r}
+mode1_fatigue_ci_LN <- run_full_bootstrap(
+  data = data,
+  model_type = 1,
+  dist = "lnorm",
+  use_gamma = TRUE,
+  use_strata = FALSE,  # 第二類資料不能分層
+  initial_params = par.hat.lognormal.model1$par # 初始值設置成MLE結果
+)
+
+print_gamma_bca_ci(mode1_fatigue_ci_LN$boot_obj, index = 4)
+```
+```{r}
+mode1_fatigue_ci_WB <- run_full_bootstrap(
+  data = data,
+  model_type = 1,
+  dist = "weibull",
+  use_gamma = TRUE,
+  use_strata = FALSE, # 第二類資料不能分層
+  initial_params = par.hat.weibull.model1$par # 初始值設置成MLE結果
+)
+
+print_gamma_bca_ci(mode1_fatigue_ci_WB$boot_obj, index = 4)
+```
+
+# LRT 模型一 ( * )
+```{r}
+par.hat.lognormal.model1.nofatigue$value
+par.hat.lognormal.model1$value
+perform_LRT(par.hat.lognormal.model1.nofatigue$value,par.hat.lognormal.model1$value,1)
+
+perform_LRT(par.hat.weibull.model1.nofatigue$value,par.hat.weibull.model1$value,1)
+```
+
+## 模型二
+
+```{r}
+# 範例：擬合「模型二」的「Weibull 分佈」
+par.hat.lognormal.model2.nofatigue <- fit_fatigue_model(
+  data = data, 
+  model_type = 2, 
+  dist = "lnorm",
+  initial_params = c(6.9817,	-1.7910,	-5.0005,0.9386),
+  use_gamma = FALSE
+) 
+  # 參考 source 516
+
+
+par.hat.weibull.model2.nofatigue <- fit_fatigue_model(
+  data = data, 
+  model_type = 2, 
+  dist = "weibull",
+  initial_params = c(6.9817,	-1.7910,	-5.0005,	0.9386	),
+  use_gamma = FALSE
+)
+par.hat.weibull.model2.nofatigue$par
+comparison_table_m2_nofatigue <- build_comparison_table(
+  par.hat.lognormal.model2.nofatigue, par.hat.weibull.model2.nofatigue,
+  model_type = 2, use_gamma = FALSE
+)
+print(comparison_table_m2_nofatigue)
+
+```
+
+```{r}
+# 假設您已經跑完 optim 得到 par.hat.lognormal.model1 和 par.hat.weibull.model1
+plot_fatigue_comparison(
+  data = data, 
+  fit_lnorm = par.hat.lognormal.model2.nofatigue, 
+  fit_weibull = par.hat.weibull.model2.nofatigue,
+  m_type_ln = 2, m_type_wb = 2,
+  use_gamma_ln = FALSE,use_gamma_wb = FALSE,
+  maintitle = "S-N diagram of Model 2 for nickel-based superalloy specimens"
+  
+)
+```
+
+## 模型二\*
+
+```{r}
+# 範例：擬合「模型二」的「Weibull 分佈」
+par.hat.lognormal.model2 <- fit_fatigue_model(
+  data = data, 
+  model_type = 2, 
+  dist = "lnorm",
+  initial_params = c(15.8935	,-1.6695,	4.4247	,-1.1292,73.4099)
+) 
+  # 參考 source 516
+
+
+par.hat.weibull.model2 <- fit_fatigue_model(
+  data = data, 
+  model_type = 2, 
+  dist = "weibull",
+  initial_params = c(15.8935	,-1.6695,	4.4247	,-1.1292,73.4099)
+  # 參考 source 516
+)
+
+comparison_table_m2 <- build_comparison_table(
+  par.hat.lognormal.model2, par.hat.weibull.model2,
+  model_type = 2, use_gamma = TRUE
+)
+print(comparison_table_m2)
+
+```
+
+```{r}
+library(fwb)
+library(ggplot2)
+library(broom)
+library(gridExtra)
+library(dplyr)
+# 假設您已經跑完 optim 得到 par.hat.lognormal.model1 和 par.hat.weibull.model1
+plot_fatigue_comparison(
+  data = data, 
+  fit_lnorm = par.hat.lognormal.model2, 
+  fit_weibull = par.hat.weibull.model2,
+  m_type_ln = 2, m_type_wb = 2,
+  maintitle = "S-N diagram of Model 2* for nickel-based superalloy specimens"
+)
+```
+
+
+## LRT 模型一與模型二
+$\sigma_1$ 
+
+```{r}
+perform_LRT(par.hat.lognormal.model1$value,par.hat.lognormal.model2$value,1)
+
+perform_LRT(par.hat.weibull.model1$value,par.hat.weibull.model2$value,1)
+```
+
+
+## weighted bootstrap
+
+```{r}
+get_fatigue_nll_func_weighted <- function(model_type = 1, dist = "lnorm", use_gamma = TRUE) {
+  
+  # 增加 weights 參數
+  function(par, data.t, data.censored, Stress.Amplitude, weights = NULL) {
+    n <- length(data.t)
+    # 如果沒給權重，預設設為 1 (即傳統 MLE)
+    if(is.null(weights)) weights <- rep(1, n)
+    
+    min_stress <- min(Stress.Amplitude)
+    
+    # --- 參數提取與邊界檢查 (同您的原始 code) ---
+    if (use_gamma) {
+      gamma <- if(model_type == 1) par[4] else par[5]
+      if(gamma >= min_stress || gamma <= 0) return(1e10)
+    } else {
+      gamma <- 0
+    }
+    
+    stress_diff <- Stress.Amplitude - gamma
+    if(any(stress_diff <= 0)) return(1e10)
+    
+    mu <- par[2] * log(stress_diff) + par[1]
+    
+    if(model_type == 1) {
+      sigma <- par[3] 
+      if(sigma <= 0) return(1e10)
+    } else {
+      sigma <- exp(par[4] * log(Stress.Amplitude) + par[3])
+      if(any(sigma <= 0) || any(!is.finite(sigma))) return(1e10)
+    }
+    
+    # --- 分佈計算 (同您的原始 code) ---
+    if(dist == "lnorm") {
+      log_dens <- dlnorm(data.t, mu, sigma, log = TRUE)
+      log_surv <- log(1 - pmin(plnorm(data.t, mu, sigma), 1 - 1e-15))
+    } else {
+      z <- (log(data.t) - mu) / sigma
+      z <- pmax(pmin(z, 700), -700) 
+      log_dens <- -log(sigma) - log(data.t) + z - exp(z)
+      log_surv <- -exp(z)
+    }
+    
+    # --- 關鍵修正：套用權重 ---
+    # lj 為向量，長度等於 n
+    lj <- data.censored * log_dens + (1 - data.censored) * log_surv
+    
+    # 將每個觀測值的貢獻乘以其對應權重再加總
+    result <- -sum(weights * lj) 
+    
+    return(if(is.finite(result)) result else 1e10)
+  }
+}
+```
+
+
+```{r}
+library(fwb)
+
+run_fwb_analysis <- function(data, model_type = 1, dist = "lnorm", use_gamma = TRUE, R = 1000, initial_params = NULL) {
+  
+  # 取得加權版 NLL 函數
+  nll_weighted <- get_fatigue_nll_func_weighted(model_type, dist, use_gamma)
+  min_s <- min(data$stress)
+  
+  # 1. 取得資料中所有唯一的應力水平（排序後方便對照結果）
+  unique_stresses <- sort(unique(data$stress))
+  p_levels <- c(0.1, 0.5, 0.9)
+  
+  # 2. 設定初始值與邊界
+  if(is.null(initial_params)) {
+    if (use_gamma) {
+      # Model 1: (b0_mu, b1_mu, sigma, gamma)
+      initial_params <- if(model_type == 1) c(16.444, -1.792, 0.634, 70.642) else c(15, -1.5, 11, -2.5, 70)
+    } else {
+      initial_params <- if(model_type == 1) c(16, -1.8, 0.6) else c(15, -1.5, 11, -2.5)
+    }
+  }
+  
+  n_par <- length(initial_params)
+  low_b <- rep(-Inf, n_par); up_b <- rep(Inf, n_par)
+  if (use_gamma) {
+    low_b[n_par] <- 0
+    up_b[n_par] <- min_s - 0.001
+  }
+  if(model_type == 1) low_b[3] <- 0.0001
+  
+  # --- 定義 fwb 專用的統計函數 ---
+  fwb_stat <- function(d, w) {
+    # 預先計算總回傳長度，以便出錯時回傳相同長度的 NA 向量
+    num_pars <- length(initial_params)
+    num_stresses <- length(unique_stresses)
+    total_return_length <- num_pars + (length(p_levels) * num_stresses)
+    
+    # 使用 tryCatch 包裹優化過程
+    result_vec <- tryCatch({
+      # A. 執行優化尋找參數
+      fit <- optim(
+        par = initial_params,
+        fn = nll_weighted,
+        data.t = d$cycles,
+        data.censored = d$censoring,
+        Stress.Amplitude = d$stress,
+        weights = w, 
+        method = "L-BFGS-B",
+        lower = low_b,
+        upper = up_b
+      )
+      
+      pars <- fit$par
+      
+      # 內部計算邏輯 (分位數計算)
+      calc_quantiles <- function(s, p) {
+        gamma_val <- if(use_gamma) (if(model_type == 1) pars[4] else pars[5]) else 0
+        location <- pars[2] * log(s - gamma_val) + pars[1]
+        current_sigma <- if(model_type == 1) pars[3] else exp(pars[4] * log(s) + pars[3])
+        
+        if(dist == "lnorm") {
+          q_std <- qnorm(p)
+        } else {
+          q_std <- log(-log(1 - p))
+        }
+        return(location + q_std * current_sigma)
+      }
+      
+      all_quantiles <- as.vector(sapply(p_levels, function(p) {
+        sapply(unique_stresses, function(s) calc_quantiles(s, p))
+      }))
+      
+      # 正常回傳
+      c(pars, all_quantiles)
+      
+    }, error = function(e) {
+      # 當錯誤發生時（例如梯度的非有限值），回傳一組長度正確的 NA 向量
+      # 這會讓該輪 Bootstrap 被紀錄為失效，但不會中斷整個 R = 1000 的循環
+      return(rep(NA, total_return_length))
+    })
+    
+    return(result_vec)
+  }
+  
+  # --- 執行 Fractional Weighted Bootstrap ---
+  cat("正在執行 Fractional Weighted Bootstrap (R =", R, ")...\n")
+  fwb_out <- fwb(data = data, statistic = fwb_stat, R = R)
+  
+  # 為結果加上名稱標籤，方便後續分析
+  param_names <- if(model_type == 1) c("b0", "b1", "sigma") else c("b0", "b1", "b0_si", "b1_si")
+  if(use_gamma) param_names <- c(param_names, "gamma")
+  
+  quantile_names <- as.vector(t(outer(paste0("p", p_levels), paste0("_s", unique_stresses), paste0)))
+  colnames(fwb_out$t) <- c(param_names, quantile_names)
+  
+  return(fwb_out)
+}
+```
+```{r}
+library(fwb)
+library(ggplot2)
+library(broom)
+library(gridExtra)
+library(dplyr)
+summarize_and_plot_fwb <- function(fwb_results, model_dist_name = "Model") {
+  
+  # 1. 定義標籤 (根據你的 run_fwb_analysis 內部定義)
+  # 基本參數固定為 4 個: b0, b1, sigma, gamma
+  base_labels <- c("b0", "b1", "sigma", "gamma")
+  
+  # 2. 建立摘要表格 (使用 tidy 函數)
+  # fwb 支援 tidy 函數來快速提取點估計值與百分位信賴區間 (perc)
+  boot_summary <- tidy(fwb_results, conf.int = TRUE, conf.level = 0.95, conf.method = "perc")
+  
+  # 由於 tidy 對 fwb 的預設 term 可能只是 index，我們手動加上標籤
+  # 注意：fwb_results$t 包含了參數與分位數，這裡我們只取前 4 個參數
+  boot_summary <- boot_summary[1:4, ]
+  boot_summary$term <- base_labels
+  
+  cat(paste0("\n--- ", model_dist_name, " 參數統計摘要 (95% CI: Percentile Method) ---\n"))
+  print(boot_summary)
+
+  # 3. 準備繪圖數據 (轉換為 Data Frame 並移除 NA)
+  boot_df <- as.data.frame(fwb_results$t[, 1:4])
+  colnames(boot_df) <- base_labels
+  boot_df <- na.omit(boot_df)
+
+  # 4. 迴圈繪製分配圖
+  plot_list <- list()
+  for(i in 1:length(base_labels)) {
+    term_name <- base_labels[i]
+    t0_value <- fwb_results$t0[i]
+    
+    p <- ggplot(boot_df, aes(x = .data[[term_name]])) +
+      geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "steelblue", color = "white", alpha = 0.7) +
+      geom_density(color = "darkred", linewidth = 1) +
+      geom_vline(xintercept = t0_value, linetype = "dashed", color = "black", size = 0.8) +
+      annotate("text", x = t0_value, y = 0, label = "MLE", vjust = -1, angle = 90, size = 3) +
+      labs(title = paste(model_dist_name, "-", term_name), 
+           x = "Bootstrap Estimate", y = "Density") +
+      theme_minimal()
+    
+    plot_list[[i]] <- p
+  }
+
+  # 5. 自動排版輸出 (2x2 矩陣)
+  grid.arrange(grobs = plot_list, ncol = 2)
+  
+  return(list(summary = boot_summary, clean_data = boot_df))
+}
+
+
+```
+
+```{r}
+# 執行 Lognormal (對數常態) 分析
+fwb_results_ln <- run_fwb_analysis(data, model_type = 1, dist = "lnorm", R = 1000,initial_params = c(6.675,-1.409,0.253,6.022))
+#執行 Weibull (韋伯) 分析
+fwb_results_wb <- run_fwb_analysis(data, model_type = 1, dist = "weibull", R = 1000,initial_params = c(6.549,-1.318,0.216,6.455))
+
+# 定義一個簡化函數來提取 95% 邊界資料 (整合自您提供的 logic)
+get_distribution_bands_v2 <- function(fwb_res, data) {
+  stress_tags <- sort(unique(data$stress))
+  boot_matrix <- fwb_res$t
+  
+  # 定義感興趣的壽命百分位數 (p0.1, p0.5, p0.9)
+  p_levels <- c("0.1", "0.5", "0.9")
+  
+  # 建立一個空清單來儲存結果，最後再合併
+  res_list <- list()
+  
+  for (s_val in stress_tags) {
+    # 建立該應力下的暫存資料框
+    stress_res <- data.frame(stress = s_val)
+    
+    for (p in p_levels) {
+      # 精確匹配該應力下的特定分位數欄位，例如 "p0.1_s450"
+      # 假設 boot_matrix 的欄位命名規則為 p[分位數]_s[應力值]
+      col_name <- paste0("p", p, "_s", s_val)
+      
+      if (col_name %in% colnames(boot_matrix)) {
+        vals <- boot_matrix[, col_name]
+        vals <- vals[!is.na(vals)]
+        
+        if (length(vals) > 0) {
+          # 分別存入該分位數的 Lower (0.025) 與 Upper (0.975)
+          # 並依據文獻方法轉換回原始循環數 (exp) [cite: 172, 182]
+          stress_res[paste0("p", p, "_Lower")] <- exp(quantile(vals, 0.025))
+          stress_res[paste0("p", p, "_Upper")] <- exp(quantile(vals, 0.975))
+        }
+      }
+    }
+    res_list[[as.character(s_val)]] <- stress_res
+  }
+  
+  # 合併所有應力的結果
+  final_table <- do.call(rbind, res_list)
+  return(final_table)
+}
+
+
+```
+```{r}
+# 取得繪圖用的邊界資料
+plot_bands_ln <- get_distribution_bands_v2(fwb_results_ln, data)
+
+plot_bands_wb <- get_distribution_bands_v2(fwb_results_wb, data)
+
+plot_bands_ln
+plot_bands_wb
+```
+
+
+```{r}
+# --- 使用範例 ---
+res_ln <- summarize_and_plot_fwb(fwb_results_ln, "Lognormal")
+res_wb <- summarize_and_plot_fwb(fwb_results_wb, "Weibull")
+```
+
+```{r}
+library(ggplot2)
+library(scales)
+library(dplyr)
+library(tidyr)
+
+# 將 wide 格式的信賴帶（plot_bands_*）轉為 long 格式：stress, Quantile, Lower, Upper, Distribution
+to_long_bands <- function(bands_wide, distribution) {
+  bands_wide %>%
+    pivot_longer(
+      cols = starts_with("p"),
+      names_to = c("Quantile", ".value"),
+      names_pattern = "p(.+)_(Lower|Upper)"
+    ) %>%
+    mutate(
+      Quantile = factor(paste0(as.numeric(Quantile) * 100, "%"),
+                        levels = c("10%", "50%", "90%")),
+      Distribution = distribution
+    )
+}
+
+bands_long <- bind_rows(
+  to_long_bands(plot_bands_ln, "Lognormal"),
+  to_long_bands(plot_bands_wb, "Weibull")
+)
+
+# 視覺參數（Weibull 陰影較淺以減少視覺壓力）
+alpha_fill_map <- c("Lognormal" = 0.5, "Weibull" = 0.25)
+line_lwd       <- 0.7
+
+p_final <- ggplot() +
+  # 信賴帶陰影：以 Quantile 配色、依分佈調整透明度
+  geom_ribbon(data = bands_long,
+              aes(y = stress, xmin = Lower, xmax = Upper,
+                  fill = Quantile, alpha = Distribution,
+                  group = interaction(Distribution, Quantile)),
+              orientation = "y") +
+  # 上下界線：依分佈使用實線（Lognormal）／虛線（Weibull）
+  geom_line(data = bands_long,
+            aes(y = stress, x = Lower, color = Quantile,
+                linetype = Distribution,
+                group = interaction(Distribution, Quantile)),
+            linewidth = line_lwd) +
+  geom_line(data = bands_long,
+            aes(y = stress, x = Upper, color = Quantile,
+                linetype = Distribution,
+                group = interaction(Distribution, Quantile)),
+            linewidth = line_lwd) +
+  # 觀測點
+  geom_point(data = data, aes(x = cycles, y = stress, shape = factor(censoring)),
+             color = "blue", size = 2, alpha = 0.7) +
+  scale_color_manual(values = c("10%" = "green", "50%" = "red", "90%" = "purple"),
+                     name = "Quantile") +
+  scale_fill_manual(values = c("10%" = "green", "50%" = "red", "90%" = "purple"),
+                    name = "Quantile C.I.") +
+  scale_linetype_manual(values = c("Lognormal" = "solid", "Weibull" = "dashed"),
+                        name = "Distribution") +
+  scale_alpha_manual(values = alpha_fill_map, guide = "none") +
+  scale_shape_manual(values = c("0" = 2, "1" = 16),
+                     labels = c("0" = "Runout", "1" = "Failure"),
+                     name = "Status") +
+  scale_x_continuous(trans = "log",
+                     breaks = trans_breaks("log10", function(x) 10^x),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  scale_y_continuous(trans = "log", labels = label_number(accuracy = 0.1)) +
+  labs(title = "S-N diagram of final model with 95% C.I. for annealed electrolytic copper wire",
+       subtitle = "the confident interval of quantile",
+       x = "thousands of cycles ", y = "stress") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "right")
+
+print(p_final)
+```
+
