@@ -1,5 +1,8 @@
 # Fatigue Life Reliability Modeling
 
+> 🏆 **Finalist — NSTC College Student Research Creativity Award (2025)**
+> 國科會大專學生研究計畫研究創作獎 入圍(2025)
+
 Statistical modeling of the fatigue life of metallic materials using **accelerated life testing (ALT)** data. This project builds and compares parametric lifetime models, estimates parameters by **maximum likelihood estimation (MLE)**, and selects models in a data-driven way using information criteria and likelihood-based tests.
 
 > 本研究以加速壽命試驗 (ALT) 資料,對金屬材料的疲勞壽命進行統計建模,並以資料導向的方式選擇最適模型。
