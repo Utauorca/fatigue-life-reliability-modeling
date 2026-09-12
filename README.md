@@ -65,3 +65,7 @@ R Markdown notebooks containing the full modeling pipeline:
 ## How to Reproduce
 
 Open any `.Rmd` file in RStudio and knit it, or run the chunks interactively. All datasets are in the repository root.
+
+## Citation
+
+If you use this work, please cite the project abstract.
