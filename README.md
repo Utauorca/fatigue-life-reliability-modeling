@@ -30,6 +30,22 @@ In corrosion-fatigue reliability research, lifetime data are commonly fitted wit
 | Model selection | Likelihood ratio test (LRT), AIC |
 | Output | p-quantile lifetime estimates & confidence intervals |
 
+## Results
+
+The final models estimate stress–life (S–N) quantile curves with **95% confidence intervals**, comparing the **log-normal** (solid) and **Weibull** (dashed) fits. Colored bands show the 10% / 50% / 90% life quantiles.
+
+### Annealed electrolytic copper wire
+
+![S–N diagram with 95% C.I. — annealed electrolytic copper wire](figures/sn_copper.jpg)
+
+Dense failure data across the full stress range yields tight confidence bands, and the log-normal and Weibull fits are nearly indistinguishable — indicating a well-identified model.
+
+### Nickel-based superalloy
+
+![S–N diagram with 95% C.I. — nickel-based superalloy](figures/sn_superalloy.jpg)
+
+Sparser data, including right-censored **runouts** (triangles), produces wider confidence bands — especially in the high-cycle tail — reflecting the greater extrapolation uncertainty at low stress levels.
+
 ## Data
 
 Fatigue test datasets for several materials (stress vs. cycles-to-failure):
